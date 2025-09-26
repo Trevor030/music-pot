@@ -1,10 +1,12 @@
 {
   "name": "discord-music-bot-prefix",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "main": "index.js",
   "type": "module",
   "license": "MIT",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "opusscript": "^0.0.8",
     "@discordjs/voice": "^0.17.0",

@@ -37,6 +37,26 @@ async function connectToVoice(channel) {
   })
 }
 
+async function resolveYouTube(query) {
+  // Returns { url, title } or throws
+  const kind = play.yt_validate(query)
+  if (kind === 'video') {
+    const info = await play.video_info(query)
+    return { url: info.video_details.url, title: info.video_details.title }
+  }
+  // Try search videos
+  let results = await play.search(query, { limit: 1, source: { youtube: 'video' } })
+  if (!results || results.length === 0) {
+    // Fallback: search music
+    results = await play.search(query, { limit: 1, source: { youtube: 'video' } })
+  }
+  if (!results || results.length === 0 || !results[0].url) {
+    throw new Error('Nessun risultato trovato su YouTube. Prova con un titolo più preciso o incolla l\'URL.')
+  }
+  const info = await play.video_info(results[0].url)
+  return { url: info.video_details.url, title: info.video_details.title }
+}
+
 async function playNext(guildId) {
   const data = queues.get(guildId)
   if (!data) return
@@ -44,30 +64,21 @@ async function playNext(guildId) {
   if (!next) { data.textChannel?.send('📭 Coda finita.'); return }
 
   try {
-    let ytInfo
-    if (play.yt_validate(next.query) === 'video') {
-      ytInfo = await play.video_info(next.query)
-    } else {
-      const res = await play.search(next.query, { limit: 1, source: { youtube: 'video' } })
-      if (!res.length) throw new Error('Nessun risultato trovato.')
-      ytInfo = await play.video_info(res[0].url)
-    }
-    const stream = await play.stream(ytInfo.video_details.url, { discordPlayerCompatibility: true })
+    const { url, title } = await resolveYouTube(next.query)
+    const stream = await play.stream(url, { discordPlayerCompatibility: true })
     const resource = createAudioResource(stream.stream, { inputType: stream.type })
     data.player.play(resource)
 
     const embed = new EmbedBuilder()
       .setTitle('▶️ In riproduzione')
-      .setDescription(`[${ytInfo.video_details.title}](${ytInfo.video_details.url})`)
-      .addFields(
-        { name: 'Durata', value: ytInfo.video_details.durationRaw || 'sconosciuta', inline: true },
-        { name: 'Canale', value: ytInfo.video_details.channel?.name || 'YouTube', inline: true }
-      )
+      .setDescription(`[${title}](${url})`)
       .setFooter({ text: `Richiesto da ${next.requestedBy}` })
     data.textChannel?.send({ embeds: [embed] })
   } catch (err) {
     console.error(err)
-    data.textChannel?.send(`⚠️ Errore con questo brano: ${err.message}`)
+    let msg = `⚠️ Errore con questo brano: ${err.message}`
+    if (/age|confirm your age|signin/i.test(err.message || '')) msg += '\n👉 Il video è soggetto a restrizioni di età/regioni.'
+    data.textChannel?.send(msg)
     playNext(guildId)
   }
 }
@@ -84,7 +95,7 @@ client.on('messageCreate', async (message) => {
   // MUSIC
   if (command === 'play') {
     const query = args.join(' ')
-    if (!query) { await message.reply('Devi scrivere un link o un titolo, es: `!play bohemian rhapsody`'); return }
+    if (!query) { await message.reply('Uso: `!play <link YouTube o titolo>`'); return }
     const vc = message.member.voice?.channel
     if (!vc) { await message.reply('Devi essere in un canale vocale 🎙️'); return }
 
@@ -178,7 +189,7 @@ client.on('messageCreate', async (message) => {
       } else {
         const content = buff.toString('utf8')
         const safe = content.length > 1900 ? content.slice(0, 1900) + '\n…(troncato)' : content
-        const codeBlock = `**${file.name}**\n\n\`\`\`\n${safe}\n\`\`\``
+        const codeBlock = `**${file.name}**\n\n\\`\\`\\`\n${safe}\n\\`\\`\\``
         await message.reply({ content: codeBlock })
       }
     } catch (e) {
