@@ -1,6 +1,6 @@
 {
   "name": "discord-music-bot-prefix",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "main": "index.js",
   "type": "module",
   "license": "MIT",

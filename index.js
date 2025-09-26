@@ -15,7 +15,8 @@ const client = new Client({
   ]
 })
 
-client.once('ready', () => console.log(`🤖 Online come ${client.user.tag}`))
+// Use clientReady (future-proof for v15)
+client.once('clientReady', () => console.log(`🤖 Online come ${client.user.tag}`))
 
 function ensureGuild(guildId, channel) {
   if (!queues.has(guildId)) {
@@ -37,16 +38,34 @@ async function connectToVoice(channel) {
   })
 }
 
+// Normalize a search result into a valid video URL
+function normalizeVideoUrl(obj) {
+  if (!obj) return null
+  if (typeof obj === 'string' && obj.startsWith('http')) return obj
+  if (obj.url && typeof obj.url === 'string') return obj.url
+  if (obj.id && typeof obj.id === 'string') return `https://www.youtube.com/watch?v=${obj.id}`
+  return null
+}
+
 async function resolveYouTube(query) {
   const kind = play.yt_validate(query)
   if (kind === 'video') {
     const info = await play.video_info(query)
-    return { url: info.video_details.url, title: info.video_details.title }
+    const url = info?.video_details?.url || normalizeVideoUrl(info?.video_details)
+    if (!url) throw new Error('URL video non valido.')
+    return { url, title: info.video_details.title || 'Video YouTube' }
   }
-  let results = await play.search(query, { limit: 1, source: { youtube: 'video' } })
-  if (!results || results.length === 0) throw new Error('Nessun risultato trovato su YouTube.')
-  const info = await play.video_info(results[0].url)
-  return { url: info.video_details.url, title: info.video_details.title }
+  const results = await play.search(query, { limit: 3, source: { youtube: 'video' } })
+  for (const r of results || []) {
+    const url = normalizeVideoUrl(r)
+    if (!url) continue
+    try {
+      const info = await play.video_info(url)
+      const finalUrl = info?.video_details?.url || url
+      if (finalUrl) return { url: finalUrl, title: info.video_details.title || 'Video YouTube' }
+    } catch (_) { /* try next */ }
+  }
+  throw new Error('Nessun risultato valido trovato su YouTube. Prova con un titolo più preciso o incolla l\'URL completo.')
 }
 
 async function playNext(guildId) {
@@ -57,14 +76,18 @@ async function playNext(guildId) {
 
   try {
     const { url, title } = await resolveYouTube(next.query)
+    if (!url) throw new Error('URL risolto non valido.')
     const stream = await play.stream(url, { discordPlayerCompatibility: true })
+    if (!stream?.stream || !stream?.type) throw new Error('Stream non disponibile per questo video.')
     const resource = createAudioResource(stream.stream, { inputType: stream.type })
     data.player.play(resource)
     const embed = new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
     data.textChannel?.send({ embeds: [embed] })
   } catch (err) {
     console.error(err)
-    data.textChannel?.send(`⚠️ Errore con questo brano: ${err.message}`)
+    let msg = `⚠️ Errore con questo brano: ${err.message}`
+    if (/age|confirm your age|signin/i.test(err.message || '')) msg += '\n👉 Il video è soggetto a restrizioni (età/regioni). Incolla un altro link.'
+    data.textChannel?.send(msg)
     playNext(guildId)
   }
 }
@@ -167,7 +190,6 @@ client.on('messageCreate', async (message) => {
       } else {
         const content = buff.toString('utf8')
         const safe = content.length > 1900 ? content.slice(0, 1900) + '\n…(troncato)' : content
-        // Use classic concatenation to avoid backtick escaping issues inside template literals
         const codeBlock = '**' + file.name + '**\n\n```\n' + safe + '\n```'
         await message.reply({ content: codeBlock })
       }
