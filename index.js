@@ -84,41 +84,43 @@ client.on('messageCreate', async (message) => {
   // MUSIC
   if (command === 'play') {
     const query = args.join(' ')
-    if (!query) return void message.reply('Devi scrivere un link o un titolo, es: `!play bohemian rhapsody`')
+    if (!query) { await message.reply('Devi scrivere un link o un titolo, es: `!play bohemian rhapsody`'); return }
     const vc = message.member.voice?.channel
-    if (!vc) return void message.reply('Devi essere in un canale vocale 🎙️')
+    if (!vc) { await message.reply('Devi essere in un canale vocale 🎙️'); return }
 
     try {
       const conn = getVoiceConnection(guildId) || await connectToVoice(vc)
       conn.subscribe(data.player)
       data.queue.push({ query, requestedBy: message.author.tag })
       if (data.player.state.status === AudioPlayerStatus.Idle) playNext(guildId)
-      return void message.reply(`🎶 Aggiunto in coda: **${query}**`)
+      await message.reply(`🎶 Aggiunto in coda: **${query}**`)
     } catch (e) {
       console.error(e)
-      return void message.reply('❌ Non riesco a connettermi al canale vocale.')
+      await message.reply('❌ Non riesco a connettermi al canale vocale.')
     }
+    return
   }
 
-  if (command === 'pause') { data.player.pause(); return void message.reply('⏸️ Pausa.') }
-  if (command === 'resume') { data.player.unpause(); return void message.reply('▶️ Ripresa.') }
-  if (command === 'skip') { data.player.stop(true); return void message.reply('⏭️ Skip.') }
-  if (command === 'stop') { data.queue.length = 0; data.player.stop(true); return void message.reply('🛑 Fermato e coda svuotata.') }
-  if (command === 'leave') { getVoiceConnection(guildId)?.destroy(); return void message.reply('👋 Uscito dal canale.') }
+  if (command === 'pause') { data.player.pause(); await message.reply('⏸️ Pausa.'); return }
+  if (command === 'resume') { data.player.unpause(); await message.reply('▶️ Ripresa.'); return }
+  if (command === 'skip') { data.player.stop(true); await message.reply('⏭️ Skip.'); return }
+  if (command === 'stop') { data.queue.length = 0; data.player.stop(true); await message.reply('🛑 Fermato e coda svuotata.'); return }
+  if (command === 'leave') { getVoiceConnection(guildId)?.destroy(); await message.reply('👋 Uscito dal canale.'); return }
 
   // GITHUB (usa GitHub API)
   if (command === 'ghrepo') {
     const repo = process.env.GITHUB_REPO
-    return void message.reply(`📦 Repo corrente: ${repo || 'non impostata (setta env GITHUB_REPO)'}`)
+    await message.reply(`📦 Repo corrente: ${repo || 'non impostata (setta env GITHUB_REPO)'}`)
+    return
   }
 
   if (command === 'ghlist') {
     const path = args[0] || ''
     const ref = args[1] // opzionale
     const repoStr = process.env.GITHUB_REPO
-    if (!repoStr) return void message.reply('⚠️ Nessuna repo impostata (env GITHUB_REPO).')
+    if (!repoStr) { await message.reply('⚠️ Nessuna repo impostata (env GITHUB_REPO).'); return }
     const [owner, repo] = repoStr.split('/')
-    if (!owner || !repo) return void message.reply('⚠️ GITHUB_REPO non valida, usa owner/repo.')
+    if (!owner || !repo) { await message.reply('⚠️ GITHUB_REPO non valida, usa owner/repo.'); return }
 
     try {
       const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`)
@@ -133,24 +135,25 @@ client.on('messageCreate', async (message) => {
       const dataApi = await res.json()
       if (Array.isArray(dataApi)) {
         const list = dataApi.map(it => `${it.type === 'dir' ? '📁' : '📄'} ${it.name}`).join('\n') || '(vuoto)'
-        return void message.reply({ embeds: [new EmbedBuilder().setTitle(`Contenuti: /${path}`).setDescription(list).setFooter({ text: `${owner}/${repo}${ref ? `@${ref}` : ''}` })] })
+        await message.reply({ embeds: [new EmbedBuilder().setTitle(`Contenuti: /${path}`).setDescription(list).setFooter({ text: `${owner}/${repo}${ref ? `@${ref}` : ''}` })] })
       } else {
-        return void message.reply({ embeds: [new EmbedBuilder().setTitle(`📄 ${dataApi.name}`).setDescription(`Dimensione: ${dataApi.size} bytes\nPath: ${dataApi.path}`).setFooter({ text: `${owner}/${repo}${ref ? `@${ref}` : ''}` })] })
+        await message.reply({ embeds: [new EmbedBuilder().setTitle(`📄 ${dataApi.name}`).setDescription(`Dimensione: ${dataApi.size} bytes\nPath: ${dataApi.path}`).setFooter({ text: `${owner}/${repo}${ref ? `@${ref}` : ''}` })] })
       }
     } catch (e) {
       console.error(e)
-      return void message.reply(`❌ Errore GitHub: ${e.message}`)
+      await message.reply(`❌ Errore GitHub: ${e.message}`)
     }
+    return
   }
 
   if (command === 'ghfile') {
     const path = args[0]
     const ref = args[1]
-    if (!path) return void message.reply('Uso: `!ghfile <percorso> [ref]`')
+    if (!path) { await message.reply('Uso: `!ghfile <percorso> [ref]`'); return }
     const repoStr = process.env.GITHUB_REPO
-    if (!repoStr) return void message.reply('⚠️ Nessuna repo impostata (env GITHUB_REPO).')
+    if (!repoStr) { await message.reply('⚠️ Nessuna repo impostata (env GITHUB_REPO).'); return }
     const [owner, repo] = repoStr.split('/')
-    if (!owner || !repo) return void message.reply('⚠️ GITHUB_REPO non valida, usa owner/repo.')
+    if (!owner || !repo) { await message.reply('⚠️ GITHUB_REPO non valida, usa owner/repo.'); return }
 
     try {
       const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`)
@@ -163,7 +166,7 @@ client.on('messageCreate', async (message) => {
       const res = await fetch(url, { headers })
       if (!res.ok) throw new Error(`GitHub ${res.status}: ${await res.text()}`)
       const file = await res.json()
-      if (file.type !== 'file') return void message.reply('❌ Il percorso non è un file.')
+      if (file.type !== 'file') { await message.reply('❌ Il percorso non è un file.'); return }
 
       const buff = Buffer.from(file.content || '', 'base64')
       const size = buff.byteLength
@@ -171,16 +174,18 @@ client.on('messageCreate', async (message) => {
 
       if (!isText || size > 1800) {
         const attach = new AttachmentBuilder(buff, { name: file.name })
-        return void message.reply({ content: `📎 ${file.name} (${size} bytes)`, files: [attach] })
+        await message.reply({ content: `📎 ${file.name} (${size} bytes)`, files: [attach] })
       } else {
         const content = buff.toString('utf8')
         const safe = content.length > 1900 ? content.slice(0, 1900) + '\n…(troncato)' : content
-        return void message.reply({ content: `**${file.name}**\n\n\` + '`' + '`\n' + safe + '\n' + '`' + '`' + '`' })
+        const codeBlock = `**${file.name}**\n\n\`\`\`\n${safe}\n\`\`\``
+        await message.reply({ content: codeBlock })
       }
     } catch (e) {
       console.error(e)
-      return void message.reply(`❌ Errore GitHub: ${e.message}`)
+      await message.reply(`❌ Errore GitHub: ${e.message}`)
     }
+    return
   }
 })
 

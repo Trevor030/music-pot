@@ -1,0 +1,1 @@
+Fixed version for code-block output in !ghfile. Use environment variables in Portainer.
