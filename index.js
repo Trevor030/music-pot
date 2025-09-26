@@ -1,5 +1,5 @@
 import 'dotenv/config'
-import { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder } from 'discord.js'
+import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js'
 import { joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior, AudioPlayerStatus, getVoiceConnection } from '@discordjs/voice'
 import { spawn } from 'child_process'
 
@@ -41,13 +41,8 @@ function isUrl(str) {
   try { new URL(str); return true } catch { return false }
 }
 
-// Spawns yt-dlp to get audio stream
 function ytDlpStream(query) {
-  const args = [
-    '-f', 'bestaudio',
-    '--no-playlist',
-    '-o', '-', query
-  ]
+  const args = ['-f', 'bestaudio', '--no-playlist', '-o', '-', query]
   return spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'ignore'] }).stdout
 }
 
@@ -55,7 +50,6 @@ async function resolveYouTube(query) {
   if (isUrl(query)) {
     return { url: query, title: query }
   } else {
-    // use yt-dlp to get first result of search
     return new Promise((resolve, reject) => {
       const args = ['-f', 'bestaudio', '--no-playlist', '--get-title', '--get-url', `ytsearch1:${query}`]
       const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] })
@@ -104,7 +98,6 @@ client.on('messageCreate', async (message) => {
   const guildId = message.guildId
   const data = ensureGuild(guildId, message.channel)
 
-  // MUSIC
   if (command === 'play') {
     const query = args.join(' ')
     if (!query) { await message.reply('Uso: `!play <link YouTube o titolo>`'); return }
@@ -127,8 +120,6 @@ client.on('messageCreate', async (message) => {
   if (command === 'skip') { data.player.stop(true); await message.reply('⏭️ Skip.'); return }
   if (command === 'stop') { data.queue.length = 0; data.player.stop(true); await message.reply('🛑 Fermato e coda svuotata.'); return }
   if (command === 'leave') { getVoiceConnection(guildId)?.destroy(); await message.reply('👋 Uscito dal canale.'); return }
-
-  // GITHUB commands same as before (can reuse code)... For brevity, omitted here but can be added if needed
 })
 
 client.login(process.env.DISCORD_TOKEN)
