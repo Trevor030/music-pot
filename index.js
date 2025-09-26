@@ -3,16 +3,6 @@ import { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder } from 'disc
 import { joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior, AudioPlayerStatus, getVoiceConnection } from '@discordjs/voice'
 import * as play from 'play-dl'
 
-// Optional: set YouTube cookie to bypass age/region restrictions
-if (process.env.YT_COOKIE) {
-  try {
-    await play.setToken({ youtube: { cookie: process.env.YT_COOKIE } })
-    console.log('🔑 YT cookie impostato.')
-  } catch (e) {
-    console.warn('⚠️ Impossibile impostare YT cookie:', e?.message || e)
-  }
-}
-
 const PREFIX = '!'
 const queues = new Map()
 
@@ -25,7 +15,7 @@ const client = new Client({
   ]
 })
 
-// Only clientReady (future-proof for v15)
+// Use only clientReady (v15-safe)
 client.once('clientReady', () => console.log(`🤖 Online come ${client.user.tag}`))
 
 function ensureGuild(guildId, channel) {
@@ -48,37 +38,28 @@ async function connectToVoice(channel) {
   })
 }
 
-function buildWatchUrlFromId(id) {
-  return id ? `https://www.youtube.com/watch?v=${id}` : null
-}
+const watchUrl = (id) => id ? `https://www.youtube.com/watch?v=${id}` : null
 
-/**
- * Resolve query to a valid basic_info object and derived url/title.
- * Returns { info, title, url }
- */
 async function resolveYouTube(query) {
+  // Accept URL or text; always return {title, id, url}
   const kind = play.yt_validate(query)
-
-  const loadBasic = async (candidate) => {
-    const info = await play.video_basic_info(candidate)
+  const getFrom = async (candidate) => {
+    const info = await play.video_info(candidate)
     const vd = info?.video_details || {}
-    const url = vd.url || buildWatchUrlFromId(vd.id) || candidate
+    const id = vd.id || vd.videoId || null
+    const url = vd.url || watchUrl(id) || candidate
     const title = vd.title || 'Video YouTube'
-    if (!url || !url.startsWith('http')) throw new Error('URL non valido dal video.')
-    return { info, title, url }
+    if (!id || !url) throw new Error('Impossibile ottenere un URL valido dal video.')
+    return { title, id, url }
   }
-
-  if (kind === 'video') {
-    return await loadBasic(query)
-  }
-
+  if (kind === 'video') return await getFrom(query)
   const results = await play.search(query, { limit: 5, source: { youtube: 'video' } })
   for (const r of results || []) {
-    const candidate = r?.url || buildWatchUrlFromId(r?.id)
+    const candidate = r?.url || watchUrl(r?.id)
     if (!candidate) continue
-    try { return await loadBasic(candidate) } catch {}
+    try { return await getFrom(candidate) } catch {}
   }
-  throw new Error("Nessun risultato valido trovato su YouTube. Prova con un titolo più preciso o incolla l'URL completo.")
+  throw new Error("Nessun risultato valido trovato su YouTube.")
 }
 
 async function playNext(guildId) {
@@ -86,25 +67,18 @@ async function playNext(guildId) {
   if (!data) return
   const next = data.queue.shift()
   if (!next) { data.textChannel?.send('📭 Coda finita.'); return }
-
   try {
-    const { info, title, url } = await resolveYouTube(next.query)
-    // 🔧 Use info object directly to stream (more reliable than URL)
-    const stream = await play.stream(info, { discordPlayerCompatibility: true })
-    if (!stream?.stream || !stream?.type) throw new Error('Stream non disponibile per questo video.')
+    const { title, id } = await resolveYouTube(next.query)
+    const urlForStream = watchUrl(id)
+    if (!urlForStream) throw new Error('URL risolto non valido.')
+    const stream = await play.stream(urlForStream, { discordPlayerCompatibility: true })
     const resource = createAudioResource(stream.stream, { inputType: stream.type })
     data.player.play(resource)
-
-    const embed = new EmbedBuilder()
-      .setTitle('▶️ In riproduzione')
-      .setDescription(`[${title}](${url})`)
-      .setFooter({ text: `Richiesto da ${next.requestedBy}` })
+    const embed = new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${urlForStream})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
     data.textChannel?.send({ embeds: [embed] })
   } catch (err) {
     console.error('playNext error:', err)
-    let msg = `⚠️ Errore con questo brano: ${err.message}`
-    if (/age|confirm your age|signin|premium|login/i.test(err.message || '')) msg += '\n👉 Il video potrebbe avere restrizioni (età/regioni/login). Incolla un altro link o imposta YT_COOKIE.'
-    data.textChannel?.send(msg)
+    data.textChannel?.send(`⚠️ Errore con questo brano: ${err.message}`)
     playNext(guildId)
   }
 }
@@ -124,7 +98,6 @@ client.on('messageCreate', async (message) => {
     if (!query) { await message.reply('Uso: `!play <link YouTube o titolo>`'); return }
     const vc = message.member.voice?.channel
     if (!vc) { await message.reply('Devi essere in un canale vocale 🎙️'); return }
-
     try {
       const conn = getVoiceConnection(guildId) || await connectToVoice(vc)
       conn.subscribe(data.player)
@@ -137,7 +110,6 @@ client.on('messageCreate', async (message) => {
     }
     return
   }
-
   if (command === 'pause') { data.player.pause(); await message.reply('⏸️ Pausa.'); return }
   if (command === 'resume') { data.player.unpause(); await message.reply('▶️ Ripresa.'); return }
   if (command === 'skip') { data.player.stop(true); await message.reply('⏭️ Skip.'); return }
@@ -150,7 +122,6 @@ client.on('messageCreate', async (message) => {
     await message.reply(`📦 Repo corrente: ${repo || 'non impostata (setta env GITHUB_REPO)'}`)
     return
   }
-
   if (command === 'ghlist') {
     const path = args[0] || ''
     const ref = args[1]
@@ -158,7 +129,6 @@ client.on('messageCreate', async (message) => {
     if (!repoStr) { await message.reply('⚠️ Nessuna repo impostata (env GITHUB_REPO).'); return }
     const [owner, repo] = repoStr.split('/')
     if (!owner || !repo) { await message.reply('⚠️ GITHUB_REPO non valida, usa owner/repo.'); return }
-
     try {
       const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`)
       if (ref) url.searchParams.set('ref', ref)
@@ -178,7 +148,6 @@ client.on('messageCreate', async (message) => {
     }
     return
   }
-
   if (command === 'ghfile') {
     const path = args[0]
     const ref = args[1]
@@ -187,7 +156,6 @@ client.on('messageCreate', async (message) => {
     if (!repoStr) { await message.reply('⚠️ Nessuna repo impostata (env GITHUB_REPO).'); return }
     const [owner, repo] = repoStr.split('/')
     if (!owner || !repo) { await message.reply('⚠️ GITHUB_REPO non valida, usa owner/repo.'); return }
-
     try {
       const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`)
       if (ref) url.searchParams.set('ref', ref)
@@ -196,11 +164,9 @@ client.on('messageCreate', async (message) => {
       if (!res.ok) throw new Error(`GitHub ${res.status}: ${await res.text()}`)
       const file = await res.json()
       if (file.type !== 'file') { await message.reply('❌ Il percorso non è un file.'); return }
-
       const buff = Buffer.from(file.content || '', 'base64')
       const size = buff.byteLength
       const isText = /^text\//.test(file.type) || /\.(txt|md|json|yml|yaml|js|ts|tsx|jsx|css|html|env|gitignore)$/i.test(file.name)
-
       if (!isText || size > 1800) {
         const attach = new AttachmentBuilder(buff, { name: file.name })
         await message.reply({ content: `📎 ${file.name} (${size} bytes)`, files: [attach] })
