@@ -15,8 +15,10 @@ const client = new Client({
   ]
 })
 
-// Future-proof for v15
-client.once('clientReady', () => console.log(`🤖 Online come ${client.user.tag}`))
+// Support both names (v14 'ready', v15 'clientReady')
+const onReady = () => console.log(`🤖 Online come ${client.user.tag}`)
+client.once('ready', onReady)
+client.once('clientReady', onReady)
 
 function ensureGuild(guildId, channel) {
   if (!queues.has(guildId)) {
@@ -42,29 +44,33 @@ function buildWatchUrlFromId(id) {
   return id ? `https://www.youtube.com/watch?v=${id}` : null
 }
 
+/**
+ * Resolve a query (URL or text) to { info, title, url } where:
+ *  - info is play.video_basic_info result
+ *  - url is a guaranteed https://www.youtube.com/watch?v=... string
+ */
 async function resolveYouTube(query) {
   const kind = play.yt_validate(query)
-  if (kind === 'video') {
-    const info = await play.video_info(query)
-    const vid = info?.video_details
-    const url = vid?.url || buildWatchUrlFromId(vid?.id)
-    if (!url) throw new Error('Impossibile ottenere un URL valido dal video.')
-    return { url, title: vid?.title || 'Video YouTube' }
+  const tryInfoFrom = async (candidate) => {
+    const info = await play.video_basic_info(candidate)
+    const vd = info?.video_details || {}
+    const url = vd.url || buildWatchUrlFromId(vd.id) || candidate
+    const title = vd.title || 'Video YouTube'
+    if (!url || !url.startsWith('http')) throw new Error('URL non valido dal video.')
+    return { info, title, url }
   }
 
-  // search fallback (try up to 3 results)
-  const results = await play.search(query, { limit: 3, source: { youtube: 'video' } })
+  if (kind === 'video') {
+    return await tryInfoFrom(query)
+  }
+
+  const results = await play.search(query, { limit: 5, source: { youtube: 'video' } })
   for (const r of results || []) {
-    const candidateUrl = r?.url || buildWatchUrlFromId(r?.id)
-    if (!candidateUrl) continue
+    const candidate = r?.url || buildWatchUrlFromId(r?.id)
+    if (!candidate) continue
     try {
-      const info = await play.video_info(candidateUrl)
-      const vid = info?.video_details
-      const finalUrl = vid?.url || buildWatchUrlFromId(vid?.id) || candidateUrl
-      if (finalUrl) return { url: finalUrl, title: vid?.title || 'Video YouTube' }
-    } catch {
-      // try next
-    }
+      return await tryInfoFrom(candidate)
+    } catch (_) { /* try next */ }
   }
   throw new Error("Nessun risultato valido trovato su YouTube. Prova con un titolo più preciso o incolla l'URL completo.")
 }
@@ -76,19 +82,24 @@ async function playNext(guildId) {
   if (!next) { data.textChannel?.send('📭 Coda finita.'); return }
 
   try {
-    const { url, title } = await resolveYouTube(next.query)
-    if (!url) throw new Error('URL risolto non valido.')
-    const stream = await play.stream(url, { discordPlayerCompatibility: true })
+    const { info, title, url } = await resolveYouTube(next.query)
+    const vd = info?.video_details || {}
+    const urlForStream = vd.url || buildWatchUrlFromId(vd.id) || url
+    if (!urlForStream || !urlForStream.startsWith('http')) throw new Error('URL risolto non valido.')
+    const stream = await play.stream(urlForStream, { discordPlayerCompatibility: true })
     if (!stream?.stream || !stream?.type) throw new Error('Stream non disponibile per questo video.')
     const resource = createAudioResource(stream.stream, { inputType: stream.type })
     data.player.play(resource)
 
-    const embed = new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
+    const embed = new EmbedBuilder()
+      .setTitle('▶️ In riproduzione')
+      .setDescription(`[${title}](${urlForStream})`)
+      .setFooter({ text: `Richiesto da ${next.requestedBy}` })
     data.textChannel?.send({ embeds: [embed] })
   } catch (err) {
     console.error(err)
     let msg = `⚠️ Errore con questo brano: ${err.message}`
-    if (/age|confirm your age|signin/i.test(err.message || '')) msg += '\n👉 Il video è soggetto a restrizioni (età/regioni). Incolla un altro link.'
+    if (/age|confirm your age|signin|premium|login/i.test(err.message || '')) msg += '\n👉 Il video potrebbe avere restrizioni (età/regioni/login). Incolla un altro link.'
     data.textChannel?.send(msg)
     playNext(guildId)
   }
