@@ -44,11 +44,7 @@ function isUrl(str) {
 function ytDlpStream(query) {
   const args = ['-f', 'bestaudio', '--no-playlist', '-o', '-', query]
   const child = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] })
-  child.stderr.on('data', d => {
-    // opzionale: log minimal per debug
-    const s = d.toString()
-    if (/ERROR|WARNING/i.test(s)) console.log('[yt-dlp]', s.trim())
-  })
+  child.stderr.on('data', d => console.error('[yt-dlp]', d.toString()))
   return child.stdout
 }
 
@@ -57,8 +53,9 @@ async function resolveYouTube(query) {
     return { url: query, title: query }
   } else {
     return new Promise((resolve, reject) => {
-      const args = ['-f', 'bestaudio', '--no-playlist', '--get-title', '--get-url', `ytsearch1:${query}`]
+      const args = ['--default-search', 'ytsearch', '-f', 'bestaudio', '--no-playlist', '--get-title', '--get-url', query]
       const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+      proc.stderr.on('data', d => console.error('[yt-dlp search]', d.toString()))
       let output = ''
       proc.stdout.on('data', d => { output += d.toString() })
       proc.on('close', code => {
