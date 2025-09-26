@@ -15,7 +15,7 @@ const client = new Client({
   ]
 })
 
-// Use clientReady (future-proof for v15)
+// Future-proof for v15
 client.once('clientReady', () => console.log(`🤖 Online come ${client.user.tag}`))
 
 function ensureGuild(guildId, channel) {
@@ -38,34 +38,35 @@ async function connectToVoice(channel) {
   })
 }
 
-// Normalize a search result into a valid video URL
-function normalizeVideoUrl(obj) {
-  if (!obj) return null
-  if (typeof obj === 'string' && obj.startsWith('http')) return obj
-  if (obj.url && typeof obj.url === 'string') return obj.url
-  if (obj.id && typeof obj.id === 'string') return `https://www.youtube.com/watch?v=${obj.id}`
-  return null
+function buildWatchUrlFromId(id) {
+  return id ? `https://www.youtube.com/watch?v=${id}` : null
 }
 
 async function resolveYouTube(query) {
   const kind = play.yt_validate(query)
   if (kind === 'video') {
     const info = await play.video_info(query)
-    const url = info?.video_details?.url || normalizeVideoUrl(info?.video_details)
-    if (!url) throw new Error('URL video non valido.')
-    return { url, title: info.video_details.title || 'Video YouTube' }
+    const vid = info?.video_details
+    const url = vid?.url || buildWatchUrlFromId(vid?.id)
+    if (!url) throw new Error('Impossibile ottenere un URL valido dal video.')
+    return { url, title: vid?.title || 'Video YouTube' }
   }
+
+  // search fallback (try up to 3 results)
   const results = await play.search(query, { limit: 3, source: { youtube: 'video' } })
   for (const r of results || []) {
-    const url = normalizeVideoUrl(r)
-    if (!url) continue
+    const candidateUrl = r?.url || buildWatchUrlFromId(r?.id)
+    if (!candidateUrl) continue
     try {
-      const info = await play.video_info(url)
-      const finalUrl = info?.video_details?.url || url
-      if (finalUrl) return { url: finalUrl, title: info.video_details.title || 'Video YouTube' }
-    } catch (_) { /* try next */ }
+      const info = await play.video_info(candidateUrl)
+      const vid = info?.video_details
+      const finalUrl = vid?.url || buildWatchUrlFromId(vid?.id) || candidateUrl
+      if (finalUrl) return { url: finalUrl, title: vid?.title || 'Video YouTube' }
+    } catch {
+      // try next
+    }
   }
-  throw new Error('Nessun risultato valido trovato su YouTube. Prova con un titolo più preciso o incolla l\'URL completo.')
+  throw new Error("Nessun risultato valido trovato su YouTube. Prova con un titolo più preciso o incolla l'URL completo.")
 }
 
 async function playNext(guildId) {
@@ -81,6 +82,7 @@ async function playNext(guildId) {
     if (!stream?.stream || !stream?.type) throw new Error('Stream non disponibile per questo video.')
     const resource = createAudioResource(stream.stream, { inputType: stream.type })
     data.player.play(resource)
+
     const embed = new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
     data.textChannel?.send({ embeds: [embed] })
   } catch (err) {
