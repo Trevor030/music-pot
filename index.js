@@ -43,7 +43,13 @@ function isUrl(str) {
 
 function ytDlpStream(query) {
   const args = ['-f', 'bestaudio', '--no-playlist', '-o', '-', query]
-  return spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'ignore'] }).stdout
+  const child = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+  child.stderr.on('data', d => {
+    // opzionale: log minimal per debug
+    const s = d.toString()
+    if (/ERROR|WARNING/i.test(s)) console.log('[yt-dlp]', s.trim())
+  })
+  return child.stdout
 }
 
 async function resolveYouTube(query) {
@@ -56,7 +62,7 @@ async function resolveYouTube(query) {
       let output = ''
       proc.stdout.on('data', d => { output += d.toString() })
       proc.on('close', code => {
-        if (code !== 0) return reject(new Error('yt-dlp failed'))
+        if (code !== 0) return reject(new Error('yt-dlp search failed'))
         const lines = output.trim().split('\n')
         if (lines.length < 2) return reject(new Error('Nessun risultato valido trovato.'))
         const title = lines[0]
