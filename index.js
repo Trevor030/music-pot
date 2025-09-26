@@ -3,6 +3,16 @@ import { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder } from 'disc
 import { joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior, AudioPlayerStatus, getVoiceConnection } from '@discordjs/voice'
 import * as play from 'play-dl'
 
+// Optional: set YouTube cookie to bypass age/region restrictions
+if (process.env.YT_COOKIE) {
+  try {
+    await play.setToken({ youtube: { cookie: process.env.YT_COOKIE } })
+    console.log('🔑 YT cookie impostato.')
+  } catch (e) {
+    console.warn('⚠️ Impossibile impostare YT cookie:', e?.message || e)
+  }
+}
+
 const PREFIX = '!'
 const queues = new Map()
 
@@ -15,10 +25,8 @@ const client = new Client({
   ]
 })
 
-// Support both names (v14 'ready', v15 'clientReady')
-const onReady = () => console.log(`🤖 Online come ${client.user.tag}`)
-client.once('ready', onReady)
-client.once('clientReady', onReady)
+// Only clientReady (future-proof for v15)
+client.once('clientReady', () => console.log(`🤖 Online come ${client.user.tag}`))
 
 function ensureGuild(guildId, channel) {
   if (!queues.has(guildId)) {
@@ -45,13 +53,13 @@ function buildWatchUrlFromId(id) {
 }
 
 /**
- * Resolve a query (URL or text) to { info, title, url } where:
- *  - info is play.video_basic_info result
- *  - url is a guaranteed https://www.youtube.com/watch?v=... string
+ * Resolve query to a valid basic_info object and derived url/title.
+ * Returns { info, title, url }
  */
 async function resolveYouTube(query) {
   const kind = play.yt_validate(query)
-  const tryInfoFrom = async (candidate) => {
+
+  const loadBasic = async (candidate) => {
     const info = await play.video_basic_info(candidate)
     const vd = info?.video_details || {}
     const url = vd.url || buildWatchUrlFromId(vd.id) || candidate
@@ -61,16 +69,14 @@ async function resolveYouTube(query) {
   }
 
   if (kind === 'video') {
-    return await tryInfoFrom(query)
+    return await loadBasic(query)
   }
 
   const results = await play.search(query, { limit: 5, source: { youtube: 'video' } })
   for (const r of results || []) {
     const candidate = r?.url || buildWatchUrlFromId(r?.id)
     if (!candidate) continue
-    try {
-      return await tryInfoFrom(candidate)
-    } catch (_) { /* try next */ }
+    try { return await loadBasic(candidate) } catch {}
   }
   throw new Error("Nessun risultato valido trovato su YouTube. Prova con un titolo più preciso o incolla l'URL completo.")
 }
@@ -83,23 +89,21 @@ async function playNext(guildId) {
 
   try {
     const { info, title, url } = await resolveYouTube(next.query)
-    const vd = info?.video_details || {}
-    const urlForStream = vd.url || buildWatchUrlFromId(vd.id) || url
-    if (!urlForStream || !urlForStream.startsWith('http')) throw new Error('URL risolto non valido.')
-    const stream = await play.stream(urlForStream, { discordPlayerCompatibility: true })
+    // 🔧 Use info object directly to stream (more reliable than URL)
+    const stream = await play.stream(info, { discordPlayerCompatibility: true })
     if (!stream?.stream || !stream?.type) throw new Error('Stream non disponibile per questo video.')
     const resource = createAudioResource(stream.stream, { inputType: stream.type })
     data.player.play(resource)
 
     const embed = new EmbedBuilder()
       .setTitle('▶️ In riproduzione')
-      .setDescription(`[${title}](${urlForStream})`)
+      .setDescription(`[${title}](${url})`)
       .setFooter({ text: `Richiesto da ${next.requestedBy}` })
     data.textChannel?.send({ embeds: [embed] })
   } catch (err) {
-    console.error(err)
+    console.error('playNext error:', err)
     let msg = `⚠️ Errore con questo brano: ${err.message}`
-    if (/age|confirm your age|signin|premium|login/i.test(err.message || '')) msg += '\n👉 Il video potrebbe avere restrizioni (età/regioni/login). Incolla un altro link.'
+    if (/age|confirm your age|signin|premium|login/i.test(err.message || '')) msg += '\n👉 Il video potrebbe avere restrizioni (età/regioni/login). Incolla un altro link o imposta YT_COOKIE.'
     data.textChannel?.send(msg)
     playNext(guildId)
   }
