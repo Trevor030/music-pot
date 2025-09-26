@@ -1,4 +1,7 @@
 import 'dotenv/config'
+import sodium from 'libsodium-wrappers'            // ensure encryption lib is ready
+await sodium.ready
+
 import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js'
 import { joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior, AudioPlayerStatus, getVoiceConnection } from '@discordjs/voice'
 import { spawn } from 'child_process'
