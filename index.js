@@ -38,21 +38,13 @@ async function connectToVoice(channel) {
 }
 
 async function resolveYouTube(query) {
-  // Returns { url, title } or throws
   const kind = play.yt_validate(query)
   if (kind === 'video') {
     const info = await play.video_info(query)
     return { url: info.video_details.url, title: info.video_details.title }
   }
-  // Try search videos
   let results = await play.search(query, { limit: 1, source: { youtube: 'video' } })
-  if (!results || results.length === 0) {
-    // Fallback: search music
-    results = await play.search(query, { limit: 1, source: { youtube: 'video' } })
-  }
-  if (!results || results.length === 0 || !results[0].url) {
-    throw new Error('Nessun risultato trovato su YouTube. Prova con un titolo più preciso o incolla l\'URL.')
-  }
+  if (!results || results.length === 0) throw new Error('Nessun risultato trovato su YouTube.')
   const info = await play.video_info(results[0].url)
   return { url: info.video_details.url, title: info.video_details.title }
 }
@@ -68,17 +60,11 @@ async function playNext(guildId) {
     const stream = await play.stream(url, { discordPlayerCompatibility: true })
     const resource = createAudioResource(stream.stream, { inputType: stream.type })
     data.player.play(resource)
-
-    const embed = new EmbedBuilder()
-      .setTitle('▶️ In riproduzione')
-      .setDescription(`[${title}](${url})`)
-      .setFooter({ text: `Richiesto da ${next.requestedBy}` })
+    const embed = new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
     data.textChannel?.send({ embeds: [embed] })
   } catch (err) {
     console.error(err)
-    let msg = `⚠️ Errore con questo brano: ${err.message}`
-    if (/age|confirm your age|signin/i.test(err.message || '')) msg += '\n👉 Il video è soggetto a restrizioni di età/regioni.'
-    data.textChannel?.send(msg)
+    data.textChannel?.send(`⚠️ Errore con questo brano: ${err.message}`)
     playNext(guildId)
   }
 }
@@ -118,7 +104,7 @@ client.on('messageCreate', async (message) => {
   if (command === 'stop') { data.queue.length = 0; data.player.stop(true); await message.reply('🛑 Fermato e coda svuotata.'); return }
   if (command === 'leave') { getVoiceConnection(guildId)?.destroy(); await message.reply('👋 Uscito dal canale.'); return }
 
-  // GITHUB (usa GitHub API)
+  // GITHUB
   if (command === 'ghrepo') {
     const repo = process.env.GITHUB_REPO
     await message.reply(`📦 Repo corrente: ${repo || 'non impostata (setta env GITHUB_REPO)'}`)
@@ -127,7 +113,7 @@ client.on('messageCreate', async (message) => {
 
   if (command === 'ghlist') {
     const path = args[0] || ''
-    const ref = args[1] // opzionale
+    const ref = args[1]
     const repoStr = process.env.GITHUB_REPO
     if (!repoStr) { await message.reply('⚠️ Nessuna repo impostata (env GITHUB_REPO).'); return }
     const [owner, repo] = repoStr.split('/')
@@ -136,11 +122,7 @@ client.on('messageCreate', async (message) => {
     try {
       const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`)
       if (ref) url.searchParams.set('ref', ref)
-      const headers = {
-        'Accept': 'application/vnd.github+json',
-        'User-Agent': 'discord-music-bot',
-        ...(process.env.GITHUB_TOKEN ? { 'Authorization': `Bearer ${process.env.GITHUB_TOKEN}` } : {})
-      }
+      const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'discord-music-bot', ...(process.env.GITHUB_TOKEN ? { 'Authorization': `Bearer ${process.env.GITHUB_TOKEN}` } : {}) }
       const res = await fetch(url, { headers })
       if (!res.ok) throw new Error(`GitHub ${res.status}: ${await res.text()}`)
       const dataApi = await res.json()
@@ -169,11 +151,7 @@ client.on('messageCreate', async (message) => {
     try {
       const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`)
       if (ref) url.searchParams.set('ref', ref)
-      const headers = {
-        'Accept': 'application/vnd.github+json',
-        'User-Agent': 'discord-music-bot',
-        ...(process.env.GITHUB_TOKEN ? { 'Authorization': `Bearer ${process.env.GITHUB_TOKEN}` } : {})
-      }
+      const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'discord-music-bot', ...(process.env.GITHUB_TOKEN ? { 'Authorization': `Bearer ${process.env.GITHUB_TOKEN}` } : {}) }
       const res = await fetch(url, { headers })
       if (!res.ok) throw new Error(`GitHub ${res.status}: ${await res.text()}`)
       const file = await res.json()
@@ -189,7 +167,8 @@ client.on('messageCreate', async (message) => {
       } else {
         const content = buff.toString('utf8')
         const safe = content.length > 1900 ? content.slice(0, 1900) + '\n…(troncato)' : content
-        const codeBlock = `**${file.name}**\n\n\\`\\`\\`\n${safe}\n\\`\\`\\``
+        // Use classic concatenation to avoid backtick escaping issues inside template literals
+        const codeBlock = '**' + file.name + '**\n\n```\n' + safe + '\n```'
         await message.reply({ content: codeBlock })
       }
     } catch (e) {
