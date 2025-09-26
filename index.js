@@ -1,7 +1,8 @@
 import 'dotenv/config'
 import { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder } from 'discord.js'
 import { joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior, AudioPlayerStatus, getVoiceConnection } from '@discordjs/voice'
-import * as play from 'play-dl'
+import ytdl from 'ytdl-core'
+import ytsr from 'ytsr'
 
 const PREFIX = '!'
 const queues = new Map()
@@ -15,7 +16,7 @@ const client = new Client({
   ]
 })
 
-// Use only clientReady (v15-safe)
+// v15-safe
 client.once('clientReady', () => console.log(`🤖 Online come ${client.user.tag}`))
 
 function ensureGuild(guildId, channel) {
@@ -38,28 +39,26 @@ async function connectToVoice(channel) {
   })
 }
 
-const watchUrl = (id) => id ? `https://www.youtube.com/watch?v=${id}` : null
+function isUrl(str) {
+  try { new URL(str); return true } catch { return false }
+}
 
 async function resolveYouTube(query) {
-  // Accept URL or text; always return {title, id, url}
-  const kind = play.yt_validate(query)
-  const getFrom = async (candidate) => {
-    const info = await play.video_info(candidate)
-    const vd = info?.video_details || {}
-    const id = vd.id || vd.videoId || null
-    const url = vd.url || watchUrl(id) || candidate
-    const title = vd.title || 'Video YouTube'
-    if (!id || !url) throw new Error('Impossibile ottenere un URL valido dal video.')
-    return { title, id, url }
+  // Returns { url, title }
+  let url = null, title = null
+  if (isUrl(query) && ytdl.validateURL(query)) {
+    url = ytdl.getURLVideoID(query) ? `https://www.youtube.com/watch?v=${ytdl.getURLVideoID(query)}` : query
+    const info = await ytdl.getBasicInfo(url)
+    title = info.videoDetails.title
+    return { url, title }
   }
-  if (kind === 'video') return await getFrom(query)
-  const results = await play.search(query, { limit: 5, source: { youtube: 'video' } })
-  for (const r of results || []) {
-    const candidate = r?.url || watchUrl(r?.id)
-    if (!candidate) continue
-    try { return await getFrom(candidate) } catch {}
-  }
-  throw new Error("Nessun risultato valido trovato su YouTube.")
+  // Search with ytsr (pure JS)
+  const search = await ytsr(query, { limit: 5 })
+  const item = search.items.find(i => i.type === 'video')
+  if (!item || !item.url) throw new Error('Nessun risultato valido trovato su YouTube.')
+  url = item.url
+  title = item.title || 'Video YouTube'
+  return { url, title }
 }
 
 async function playNext(guildId) {
@@ -67,18 +66,27 @@ async function playNext(guildId) {
   if (!data) return
   const next = data.queue.shift()
   if (!next) { data.textChannel?.send('📭 Coda finita.'); return }
+
   try {
-    const { title, id } = await resolveYouTube(next.query)
-    const urlForStream = watchUrl(id)
-    if (!urlForStream) throw new Error('URL risolto non valido.')
-    const stream = await play.stream(urlForStream, { discordPlayerCompatibility: true })
-    const resource = createAudioResource(stream.stream, { inputType: stream.type })
+    const { url, title } = await resolveYouTube(next.query)
+    // ytdl-core readable stream (audio only, highest quality)
+    const stream = ytdl(url, {
+      filter: 'audioonly',
+      quality: 'highestaudio',
+      highWaterMark: 1<<25, // smoother
+    })
+    const resource = createAudioResource(stream)
     data.player.play(resource)
-    const embed = new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${urlForStream})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
+
+    const embed = new EmbedBuilder()
+      .setTitle('▶️ In riproduzione')
+      .setDescription(`[${title}](${url})`)
+      .setFooter({ text: `Richiesto da ${next.requestedBy}` })
     data.textChannel?.send({ embeds: [embed] })
   } catch (err) {
     console.error('playNext error:', err)
-    data.textChannel?.send(`⚠️ Errore con questo brano: ${err.message}`)
+    let msg = `⚠️ Errore con questo brano: ${err.message}`
+    data.textChannel?.send(msg)
     playNext(guildId)
   }
 }
