@@ -1,17 +1,16 @@
 version: "3.9"
-
 services:
   discord-music-bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: discord-music-bot
     restart: unless-stopped
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
       CLIENT_ID: ${CLIENT_ID}
       GUILD_ID: ${GUILD_ID}
-      # Opzionali per GitHub (se repo privata per i comandi gh*)
       GITHUB_TOKEN: ${GITHUB_TOKEN}
       GITHUB_REPO: ${GITHUB_REPO}
-    # Se preferisci, puoi rimuovere env_file e inserire le variabili direttamente in Portainer
     env_file:
       - .env
