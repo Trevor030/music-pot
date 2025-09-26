@@ -1,32 +1,25 @@
 import 'dotenv/config'
-import sodium from 'libsodium-wrappers'            // ensure encryption lib is ready
+import sodium from 'libsodium-wrappers'
 await sodium.ready
 
 import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js'
-import { joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior, AudioPlayerStatus, getVoiceConnection } from '@discordjs/voice'
+import { joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior, AudioPlayerStatus, getVoiceConnection, StreamType } from '@discordjs/voice'
 import { spawn } from 'child_process'
 
 const PREFIX = '!'
 const queues = new Map()
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 })
 
 client.once('clientReady', () => console.log(`🤖 Online come ${client.user.tag}`))
 
 function ensureGuild(guildId, channel) {
   if (!queues.has(guildId)) {
-    queues.set(guildId, {
-      queue: [],
-      player: createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } }),
-      textChannel: channel
-    })
+    const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } })
+    player.on('error', e => console.error('Audio player error:', e))
+    queues.set(guildId, { queue: [], player, textChannel: channel })
   }
   return queues.get(guildId)
 }
@@ -44,11 +37,23 @@ function isUrl(str) {
   try { new URL(str); return true } catch { return false }
 }
 
-function ytDlpStream(query) {
-  const args = ['-f', 'bestaudio', '--no-playlist', '-o', '-', query]
-  const child = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] })
-  child.stderr.on('data', d => console.error('[yt-dlp]', d.toString()))
-  return child.stdout
+// Build a robust pipeline: yt-dlp -> ffmpeg (transcode/demux) -> ogg/opus
+function buildAudioPipeline(query) {
+  const ytdlp = spawn('yt-dlp', ['-f', 'bestaudio', '--no-playlist', '-o', '-', query], { stdio: ['ignore', 'pipe', 'pipe'] })
+  ytdlp.stderr.on('data', d => console.error('[yt-dlp]', d.toString()))
+  const ffmpeg = spawn('ffmpeg', [
+    '-loglevel', 'error',
+    '-i', 'pipe:0',
+    '-vn',
+    '-ac', '2',
+    '-f', 'ogg',
+    '-c:a', 'libopus',
+    '-b:a', '128k',
+    'pipe:1'
+  ], { stdio: ['pipe', 'pipe', 'pipe'] })
+  ytdlp.stdout.pipe(ffmpeg.stdin)
+  ffmpeg.stderr.on('data', d => console.error('[ffmpeg]', d.toString()))
+  return ffmpeg.stdout
 }
 
 async function resolveYouTube(query) {
@@ -80,13 +85,10 @@ async function playNext(guildId) {
   if (!next) { data.textChannel?.send('📭 Coda finita.'); return }
   try {
     const { url, title } = await resolveYouTube(next.query)
-    const stream = ytDlpStream(url)
-    const resource = createAudioResource(stream)
+    const stream = buildAudioPipeline(url)
+    const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
     data.player.play(resource)
-    const embed = new EmbedBuilder()
-      .setTitle('▶️ In riproduzione')
-      .setDescription(`[${title}](${url})`)
-      .setFooter({ text: `Richiesto da ${next.requestedBy}` })
+    const embed = new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
     data.textChannel?.send({ embeds: [embed] })
   } catch (err) {
     console.error('playNext error:', err)
@@ -106,9 +108,9 @@ client.on('messageCreate', async (message) => {
 
   if (command === 'play') {
     const query = args.join(' ')
-    if (!query) { await message.reply('Uso: `!play <link YouTube o titolo>`'); return }
+    if (!query) return void message.reply('Uso: `!play <link YouTube o titolo>`')
     const vc = message.member.voice?.channel
-    if (!vc) { await message.reply('Devi essere in un canale vocale 🎙️'); return }
+    if (!vc) return void message.reply('Devi essere in un canale vocale 🎙️')
     try {
       const conn = getVoiceConnection(guildId) || await connectToVoice(vc)
       conn.subscribe(data.player)
@@ -121,11 +123,11 @@ client.on('messageCreate', async (message) => {
     }
     return
   }
-  if (command === 'pause') { data.player.pause(); await message.reply('⏸️ Pausa.'); return }
-  if (command === 'resume') { data.player.unpause(); await message.reply('▶️ Ripresa.'); return }
-  if (command === 'skip') { data.player.stop(true); await message.reply('⏭️ Skip.'); return }
-  if (command === 'stop') { data.queue.length = 0; data.player.stop(true); await message.reply('🛑 Fermato e coda svuotata.'); return }
-  if (command === 'leave') { getVoiceConnection(guildId)?.destroy(); await message.reply('👋 Uscito dal canale.'); return }
+  if (command === 'pause') { data.player.pause(); return void message.reply('⏸️ Pausa.') }
+  if (command === 'resume') { data.player.unpause(); return void message.reply('▶️ Ripresa.') }
+  if (command === 'skip') { data.player.stop(true); return void message.reply('⏭️ Skip.') }
+  if (command === 'stop') { data.queue.length = 0; data.player.stop(true); return void message.reply('🛑 Fermato e coda svuotata.') }
+  if (command === 'leave') { getVoiceConnection(guildId)?.destroy(); return void message.reply('👋 Uscito dal canale.') }
 })
 
 client.login(process.env.DISCORD_TOKEN)
