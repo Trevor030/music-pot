@@ -1,0 +1,14 @@
+version: "3.9"
+services:
+  discord-music-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discord-music-bot
+    restart: unless-stopped
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      CLIENT_ID: ${CLIENT_ID}
+      GUILD_ID: ${GUILD_ID}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GITHUB_REPO: ${GITHUB_REPO}
