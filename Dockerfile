@@ -1,10 +1,15 @@
-FROM node:20-bullseye
+# Stage 1: bring ffmpeg without apt-get
+FROM ghcr.io/jrottenberg/ffmpeg:6.1-ubuntu2204 AS ffmpeg
 
-# bullseye has more stable apt mirrors in some environments
-RUN apt-get update && apt-get install -y --no-install-recommends \    ffmpeg \    wget \    ca-certificates \ && rm -rf /var/lib/apt/lists/*
+# Stage 2: Node runtime
+FROM node:20
 
-# prebuilt yt-dlp binary
-RUN wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \    -O /usr/local/bin/yt-dlp \ && chmod a+rx /usr/local/bin/yt-dlp
+# Copy ffmpeg from stage1 (binaries, libs, etc. under /usr/local)
+COPY --from=ffmpeg /usr/local /usr/local
+
+# Add yt-dlp binary directly (no apt/curl needed)
+ADD https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp /usr/local/bin/yt-dlp
+RUN chmod a+rx /usr/local/bin/yt-dlp
 
 WORKDIR /app
 COPY package.json package-lock.json* ./
