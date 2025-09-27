@@ -1,5 +1,5 @@
 \
-// robust25.4-stream-help: streaming pipeline + UX + menu Help interattivo
+// robust25.5-stream-help-controls: streaming + Help interattivo + pannello controlli Now Playing
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 
@@ -25,7 +25,7 @@ const HELP_SECTIONS = {
     .addFields(
       { name: '🎵 Musica', value: '`play`, `pause`, `resume`' },
       { name: '🧭 Coda', value: '`queue`, `skip`, `stop`' },
-      { name: '⚙️ Varie', value: '`leave`, `help`' }
+      { name: '⚙️ Varie', value: '`leave`, `np`, `help`' }
     ),
   music: new EmbedBuilder()
     .setTitle('🎵 Comandi Musica')
@@ -45,6 +45,7 @@ const HELP_SECTIONS = {
     .setTitle('⚙️ Altri Comandi')
     .setDescription([
       '`!leave` — il bot esce dal canale vocale',
+      '`!np` — mostra il pannello controlli',
       '`!help` — apre questo menu'
     ].join('\n')),
 }
@@ -59,7 +60,6 @@ function helpComponents(active = 'main') {
       { label: 'Coda', value: 'queue', emoji: '🧭', default: active==='queue' },
       { label: 'Varie', value: 'misc',  emoji: '⚙️', default: active==='misc'  },
     )
-
   const row1 = new ActionRowBuilder().addComponents(select)
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('help_prev').setLabel('◀️ Indice').setStyle(ButtonStyle.Secondary),
@@ -70,18 +70,61 @@ function helpComponents(active = 'main') {
   return [row1, row2]
 }
 
+// ---- NOW PLAYING CONTROLS ----
+function controlEmbed(title, status = 'idle') {
+  const playing = status === 'playing'
+  return new EmbedBuilder()
+    .setTitle(playing ? '🎧 In riproduzione' : '⏹️ Non in riproduzione')
+    .setDescription(playing ? `**${title || '—'}**` : 'Usa `!play <link|titolo>` per iniziare.')
+}
+
+function controlComponents(status = 'idle') {
+  const playing = status === 'playing'
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(playing ? 'ctrl_pause' : 'ctrl_resume')
+      .setLabel(playing ? 'Pausa' : 'Riprendi').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ctrl_skip').setLabel('Skip').setStyle(ButtonStyle.Primary).setDisabled(!playing),
+    new ButtonBuilder().setCustomId('ctrl_stop').setLabel('Stop').setStyle(ButtonStyle.Danger).setDisabled(!playing),
+    new ButtonBuilder().setCustomId('ctrl_queue').setLabel('Queue').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ctrl_leave').setLabel('Leave').setStyle(ButtonStyle.Secondary)
+  )
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('ctrl_refresh').setLabel('Refresh').setStyle(ButtonStyle.Secondary)
+  )
+  return [row, row2]
+}
+
+async function upsertControls(guildId, status = 'idle') {
+  const data = queues.get(guildId); if (!data || !data.textChannel) return
+  const embed = controlEmbed(data.nowTitle, status)
+  const comps = controlComponents(status)
+  try {
+    if (data.controlsMsgId) {
+      const m = await data.textChannel.messages.fetch(data.controlsMsgId).catch(() => null)
+      if (m) { await m.edit({ embeds: [embed], components: comps }); return }
+    }
+    const sent = await data.textChannel.send({ embeds: [embed], components: comps })
+    data.controlsMsgId = sent.id
+  } catch (e) { console.error('[controls]', e) }
+}
+
 // ---------- Helpers ----------
 function ensureGuild(guildId, channel){
   if(!queues.has(guildId)){
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } })
-    const data = { queue: [], player, textChannel: channel, current: null, playing: false }
+    const data = { 
+      queue: [], player, textChannel: channel, current: null, playing: false,
+      nowTitle: null, controlsMsgId: null
+    }
     player.on(AudioPlayerStatus.Idle, () => {
       data.playing = false
       cleanup(data)
+      upsertControls(channel.guild.id, 'idle')
       if (data.queue.length) playNext(channel.guild.id).catch(()=>{})
     })
     player.on('error', e => {
       console.error('[player]', e); data.playing = false; cleanup(data)
+      upsertControls(channel.guild.id, 'idle')
       if (data.queue.length) playNext(channel.guild.id).catch(()=>{})
     })
     queues.set(guildId, data)
@@ -158,9 +201,14 @@ async function playNext(guildId){
     const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
     data.player.once(AudioPlayerStatus.Playing, async () => {
       clearTimeout(slowTimer)
+      data.nowTitle = title
       if (msg) { try { await msg.edit(`▶️ In riproduzione: **${title}**`) } catch {} }
+      upsertControls(guildId, 'playing')
     })
     data.player.play(resource)
+
+    // fallback: prova a mostrare i controlli anche se l'evento non scatta
+    setTimeout(() => upsertControls(guildId, data.player.state.status === AudioPlayerStatus.Playing ? 'playing' : 'idle'), 1500)
 
   } catch (e) {
     clearTimeout(slowTimer)
@@ -193,19 +241,61 @@ client.once('clientReady', async () => {
 
 client.on('interactionCreate', async (i) => {
   try {
+    // ----- HELP -----
     if (i.isStringSelectMenu() && i.customId === 'help_select') {
       const value = i.values?.[0] || 'main'
       const embed = HELP_SECTIONS[value] || HELP_SECTIONS.main
       return void i.update({ embeds: [embed], components: helpComponents(value) })
     }
-    if (i.isButton()) {
+    if (i.isButton() && i.customId.startsWith('help_')) {
       if (i.customId === 'help_prev')  return void i.update({ embeds: [HELP_SECTIONS.main],  components: helpComponents('main') })
       if (i.customId === 'help_music') return void i.update({ embeds: [HELP_SECTIONS.music], components: helpComponents('music') })
       if (i.customId === 'help_queue') return void i.update({ embeds: [HELP_SECTIONS.queue], components: helpComponents('queue') })
-      if (i.customId === 'help_misc')  return void i.update({ embeds: [HELP_SECTIONS.misc],  components: helpComponents('misc') })
+      if (i.customId === 'help_misc') return void i.update({ embeds: [HELP_SECTIONS.misc],  components: helpComponents('misc') })
+    }
+
+    // ----- CONTROLS -----
+    if (i.isButton() && i.customId.startsWith('ctrl_')) {
+      const data = queues.get(i.guildId)
+      if (!data) return void i.reply({ content: 'Nessun contesto di riproduzione.', ephemeral: true })
+
+      if (i.customId === 'ctrl_pause') {
+        data.player.pause()
+        await i.deferUpdate()
+        return upsertControls(i.guildId, 'idle')
+      }
+      if (i.customId === 'ctrl_resume') {
+        data.player.unpause()
+        await i.deferUpdate()
+        return upsertControls(i.guildId, 'playing')
+      }
+      if (i.customId === 'ctrl_skip') {
+        data.player.stop(true); cleanup(data)
+        await i.deferUpdate()
+        if (data.queue.length) playNext(i.guildId).catch(()=>{})
+        return upsertControls(i.guildId, 'idle')
+      }
+      if (i.customId === 'ctrl_stop') {
+        data.queue.length = 0; data.player.stop(true); cleanup(data); data.playing = false
+        await i.deferUpdate()
+        return upsertControls(i.guildId, 'idle')
+      }
+      if (i.customId === 'ctrl_leave') {
+        getVoiceConnection(i.guildId)?.destroy(); cleanup(data); data.playing = false
+        await i.deferUpdate()
+        return upsertControls(i.guildId, 'idle')
+      }
+      if (i.customId === 'ctrl_queue') {
+        const rest = data.queue.map((q, idx) => `${idx+1}. ${q.query}`).join('\n') || '—'
+        return void i.reply({ content: `In coda:\n${rest}`, ephemeral: true })
+      }
+      if (i.customId === 'ctrl_refresh') {
+        await i.deferUpdate()
+        return upsertControls(i.guildId, data.player.state.status === AudioPlayerStatus.Playing ? 'playing' : 'idle')
+      }
     }
   } catch (err) {
-    console.error('[help interaction]', err)
+    console.error('[interaction]', err)
     if (i.isRepliable() && !i.replied && !i.deferred) {
       await i.reply({ content: '❌ Qualcosa è andato storto.', ephemeral: true })
     }
@@ -220,9 +310,8 @@ client.on('messageCreate', async (m) => {
   const cmd = (args.shift()||'').toLowerCase()
   const data = ensureGuild(m.guildId, m.channel)
 
-  if (cmd === 'help') {
-    return void m.reply({ embeds: [HELP_SECTIONS.main], components: helpComponents('main') })
-  }
+  if (cmd === 'help') return void m.reply({ embeds: [HELP_SECTIONS.main], components: helpComponents('main') })
+  if (cmd === 'np') { await upsertControls(m.guildId, (data.player.state.status === AudioPlayerStatus.Playing ? 'playing' : 'idle')); return }
 
   if (cmd === 'play'){
     const q = args.join(' ')
