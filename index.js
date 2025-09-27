@@ -1,11 +1,10 @@
 \
-// robust25.9-minigui-status-progress-volume-queue
+// 26.0-minigui-status-progress-counter
 // - Pannello unico (search/playing/error)
 // - Anti-duplicazione pannello
 // - Barra progressiva LIVE (aggiornamento periodico)
 // - Capitalizzazione prima lettera titolo
-// - Volume +/- con visualizzazione percentuale
-// - Bottone Queue (ephemeral) con elenco prossimi brani
+// - Contatore tempo: trascorso e rimanente (niente controlli volume)
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 
@@ -22,19 +21,16 @@ import { spawn } from 'child_process'
 const PREFIX = '!'
 const DELETE_COMMANDS = (process.env.DELETE_COMMANDS || 'true').toLowerCase() === 'true'
 const PROGRESS_INTERVAL_MS = Number(process.env.PROGRESS_INTERVAL_MS || 5000) // refresh pannello
-const VOL_STEP = Number(process.env.VOL_STEP || 0.1)       // passo regolazione volume
-const VOL_MIN = Number(process.env.VOL_MIN || 0.2)         // minimo logico
-const VOL_MAX = Number(process.env.VOL_MAX || 2.0)         // massimo (200%)
 
 const queues = new Map()
 
 // Tema + emoji
 const THEME = { color: Number(process.env.THEME_COLOR || 0xED4245) }
-const EMO = { prev:'⏮️', pause:'⏸️', play:'▶️', stop:'⏹️', skip:'⏭️', search:'🔎', err:'❌', volDown:'🔉', volUp:'🔊', list:'🧭' }
+const EMO = { prev:'⏮️', pause:'⏸️', play:'▶️', stop:'⏹️', skip:'⏭️', search:'🔎', err:'❌', list:'🧭', timer:'⏱️' }
 
 const capFirst = (s) => { s = String(s||'').trim(); return s ? s[0].toUpperCase()+s.slice(1) : s }
 const fmtDur = (sec) => { if(sec==null) return '—'; sec=Math.max(0, Math.floor(sec)); const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60; return h?`${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${m}:${String(s).padStart(2,'0')}` }
-function progressBar(pos=0, dur=0, width=18){
+function progressBar(pos=0, dur=0, width=20){
   if(!dur || dur<=0) return '―'.repeat(width)
   const p = Math.max(0, Math.min(1, pos/dur)); const i = Math.max(0, Math.min(width-1, Math.round(p*(width-1))))
   const left = '─'.repeat(i), right = '─'.repeat(width-1-i)
@@ -48,8 +44,7 @@ function ensureGuild(guildId, channel){
       queue: [], player, textChannel: channel, current: null, playing: false,
       nowTitle: null, controlsMsgId: null, uploader: null,
       requesterId: null, requesterTag: null, lastStatus: 'idle', lastError: null,
-      resource: null, durationSec: null, progressTimer: null, nextQuery: null,
-      volume: 0.8 // 80% di default
+      resource: null, durationSec: null, progressTimer: null, nextQuery: null
     }
     player.on(AudioPlayerStatus.Idle, () => {
       data.playing = false; clearInterval(data.progressTimer); data.progressTimer = null
@@ -111,15 +106,14 @@ function panelEmbed(data, status='idle', extra={}){
     e.setDescription(`**${EMO.search} Sto preparando il brano…**\nRichiesta: \`${data.nextQuery || '—'}\``)
   } else if (status==='playing'){
     const requester = data.requesterId ? `<@${data.requesterId}>` : (data.requesterTag?`[${data.requesterTag}]`:'')
-    // progress live
     const pos = data.resource ? Math.floor((data.resource.playbackDuration || 0)/1000) : 0
     const dur = data.durationSec ?? 0
     const bar = progressBar(pos, dur, 20)
-    const volPct = Math.round((data.volume || 0.8)*100)
+    const rem = Math.max(0, (dur||0) - pos)
     e.setDescription([
       `**Now Playing** \`${data.nowTitle||'—'}\`  by ${requester||'—'}`,
-      dur ? `\`${bar}\` \`${fmtDur(pos)} / ${fmtDur(dur)}\`` : '',
-      `🔈 Volume: **${volPct}%**`
+      dur ? `\`${bar}\`` : '',
+      dur ? `${EMO.timer} **${fmtDur(pos)}** trascorsi • **-${fmtDur(rem)}** rimanenti  *(totale ${fmtDur(dur)})*` : ''
     ].filter(Boolean).join('\n'))
   } else if (status==='error'){
     const msg = extra.message || data.lastError || 'Si è verificato un errore.'
@@ -138,11 +132,7 @@ function panelButtons(status='idle'){
     new ButtonBuilder().setCustomId('ctrl_stop').setEmoji(EMO.stop).setStyle(ButtonStyle.Danger).setDisabled(!playing),
     new ButtonBuilder().setCustomId('ctrl_queue').setEmoji(EMO.list).setStyle(ButtonStyle.Secondary)
   )
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ctrl_vol_down').setEmoji(EMO.volDown).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('ctrl_vol_up').setEmoji(EMO.volUp).setStyle(ButtonStyle.Secondary)
-  )
-  return [row1, row2]
+  return [row1]
 }
 async function upsertPanel(guildId, status='idle', extra={}){
   const data = queues.get(guildId); if (!data || !data.textChannel) return
@@ -191,8 +181,6 @@ async function playNext(guildId){
 
     const resource = createAudioResource(stream, { inputType: StreamType.OggOpus, inlineVolume: true })
     data.resource = resource
-    // applica volume corrente
-    try{ resource.volume?.setVolumeLogarithmic(data.volume || 0.8) }catch{}
 
     data.player.once(AudioPlayerStatus.Playing, async () => {
       await upsertPanel(guildId,'playing')
@@ -227,7 +215,6 @@ const client = new Client({ intents: [
 
 client.once('clientReady', () => {
   console.log(`🤖 Online come ${client.user.tag}`)
-  // badge istanza per diagnosticare doppie istanze
   client.user.setPresence({ activities: [{ name: `instance ${process.pid}`, type: 0 }], status: 'online' })
 })
 
@@ -241,20 +228,6 @@ client.on('interactionCreate', async (i) => {
     if (i.customId==='ctrl_resume'){ data.player.unpause(); await i.deferUpdate(); return upsertPanel(i.guildId, 'playing') }
     if (i.customId==='ctrl_skip'){ data.player.stop(true); cleanup(data); await i.deferUpdate(); clearInterval(data.progressTimer); data.progressTimer=null; if (data.queue.length) playNext(i.guildId).catch(()=>{}); return upsertPanel(i.guildId, 'idle') }
     if (i.customId==='ctrl_stop'){ data.queue.length=0; data.player.stop(true); cleanup(data); data.playing=false; await i.deferUpdate(); clearInterval(data.progressTimer); data.progressTimer=null; return upsertPanel(i.guildId, 'idle') }
-
-    if (i.customId==='ctrl_vol_down'){
-      data.volume = Math.max(VOL_MIN, Math.round((data.volume - VOL_STEP)*10)/10)
-      try{ data.resource?.volume?.setVolumeLogarithmic(data.volume) }catch{}
-      await i.deferUpdate()
-      return upsertPanel(i.guildId, data.player.state.status===AudioPlayerStatus.Playing?'playing':'idle')
-    }
-    if (i.customId==='ctrl_vol_up'){
-      data.volume = Math.min(VOL_MAX, Math.round((data.volume + VOL_STEP)*10)/10)
-      try{ data.resource?.volume?.setVolumeLogarithmic(data.volume) }catch{}
-      await i.deferUpdate()
-      return upsertPanel(i.guildId, data.player.state.status===AudioPlayerStatus.Playing?'playing':'idle')
-    }
-
     if (i.customId==='ctrl_queue'){
       const list = data.queue.slice(0, 15).map((q,idx)=> `${idx+1}. ${q.query}`).join('\n') || '—'
       return void i.reply({ content: `Prossimi brani:\n${list}`, ephemeral: true })
