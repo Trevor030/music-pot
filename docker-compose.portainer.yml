@@ -8,4 +8,3 @@ services:
     environment:
       DISCORD_TOKEN: "${DISCORD_TOKEN}"
       PROGRESS_INTERVAL_MS: "3000"
-    # nessun volume, nessun build

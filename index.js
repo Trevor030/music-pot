@@ -1,8 +1,8 @@
-// 26.1-fix3 — clean chat, single panel/queue, race-free queue/skip, locked channel, skip feedback, no pause/queue, disconnect button
+// 26.1-fix3.1 — single panel (mutex), fast skip feedback (no unknown interaction), locked channel
 import 'dotenv/config'
 import {
   Client, GatewayIntentBits,
-  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle
+  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags
 } from 'discord.js'
 import {
   joinVoiceChannel, createAudioPlayer, createAudioResource,
@@ -38,7 +38,8 @@ function ensureSession(guildId, channel){
       resource: null, durationSec: null,
       progressTimer: null, nextQuery: null,
       requesterId: null, requesterTag: null,
-      advancing: false
+      advancing: false,
+      panelUpdating: false  // mutex pannello
     }
     player.on(AudioPlayerStatus.Idle, ()=>{
       const d = queues.get(guildId); if(!d) return
@@ -61,6 +62,7 @@ function ensureSession(guildId, channel){
 }
 
 // --- helpers ---
+function wait(ms){ return new Promise(r=>setTimeout(r,ms)) }
 function stopTimers(data){ try { clearInterval(data.progressTimer) } catch {} ; data.progressTimer=null }
 function killCurrent(data){
   try{ data.player.stop(true) }catch{}
@@ -97,6 +99,20 @@ function streamWebmOpus(input){
   const proc = spawn('yt-dlp', ['-f','251/bestaudio','--no-playlist','-o','-','--', query], { stdio:['ignore','pipe','pipe'] })
   proc.stderr.on('data', d => console.error('[yt-dlp]', d.toString().trim()))
   return { proc, stream: proc.stdout }
+}
+
+// --- panel lock & prune ---
+async function withPanelLock(data, fn) {
+  while (data.panelUpdating) await wait(35)
+  data.panelUpdating = true
+  try { return await fn() } finally { data.panelUpdating = false }
+}
+async function pruneOldPanels(data, keepId) {
+  try {
+    const recent = await data.textChannel.messages.fetch({ limit: 50 })
+    const mine = [...recent.values()].filter(m => m.author?.id === m.client?.user?.id)
+    for (const m of mine) { if (m.id !== keepId) await m.delete().catch(()=>{}) }
+  } catch {}
 }
 
 // --- UI ---
@@ -137,32 +153,24 @@ function panelButtons(status='idle'){
 
 async function upsertPanel(guildId, status='idle', extra={}){
   const data = queues.get(guildId); if (!data || !data.textChannel) return
-  data.lastStatus = status
-  const embed = panelEmbed(data, status, extra); const comps = panelButtons(status)
-  try{
-    if (data.controlsMsgId){
+  return withPanelLock(data, async () => {
+    data.lastStatus = status
+    const embed = panelEmbed(data, status, extra); const comps = panelButtons(status)
+
+    if (data.controlsMsgId) {
       const m = await data.textChannel.messages.fetch(data.controlsMsgId).catch(()=>null)
-      if (m){ await m.edit({ embeds:[embed], components: comps }); return }
+      if (m) { await m.edit({ embeds:[embed], components: comps }); await pruneOldPanels(data, m.id); return }
       data.controlsMsgId = null
     }
-    const recent = await data.textChannel.messages.fetch({ limit: 30 }).catch(()=>null)
-    if (recent){
-      const mine = recent.find(msg => msg.author?.id === msg.client?.user?.id)
-      if (mine){ data.controlsMsgId = mine.id; await mine.edit({ embeds:[embed], components: comps });
-        for (const m of recent.values()){
-          if (m.id !== mine.id && m.author?.id === mine.author?.id) await m.delete().catch(()=>{})
-        }
-        return
-      }
-    }
+    try {
+      const recent = await data.textChannel.messages.fetch({ limit: 50 })
+      const mine = [...recent.values()].find(msg => msg.author?.id === msg.client?.user?.id)
+      if (mine) { data.controlsMsgId = mine.id; await mine.edit({ embeds:[embed], components: comps }); await pruneOldPanels(data, mine.id); return }
+    } catch {}
     const sent = await data.textChannel.send({ embeds:[embed], components: comps })
     data.controlsMsgId = sent.id
-    if (recent){
-      for (const m of recent.values()){
-        if (m.id !== sent.id && m.author?.id === sent.author?.id) await m.delete().catch(()=>{})
-      }
-    }
-  }catch(e){ console.error('[panel]', e) }
+    await pruneOldPanels(data, sent.id)
+  })
 }
 
 async function upsertQueueMessage(guildId){
@@ -265,7 +273,6 @@ client.once('ready', ()=>{
 client.on('interactionCreate', async (i)=>{
   if (!i.isButton()) return
   const data = queues.get(i.guildId); if(!data) return void i.deferUpdate()
-  // blocca interazioni se non provengono dal canale autorizzato
   if (i.channelId !== ALLOWED_TEXT_CHANNEL_ID) return void i.deferUpdate()
 
   try {
@@ -273,17 +280,18 @@ client.on('interactionCreate', async (i)=>{
       const d = queues.get(i.guildId)
       const nextItem = d?.queue?.[0]
 
+      // Rispondi SUBITO (ephemeral con flags) per evitare timeout
       if (nextItem) {
+        await i.reply({ content: `⏭️ Skippato. Prossimo: **${nextItem.query}** — sto per riprodurlo…`, flags: MessageFlags.Ephemeral })
         d.nextQuery = nextItem.query
         await upsertPanel(i.guildId,'search')
-        try {
-          const meta = await resolveMeta(nextItem.query)
-          await i.reply({ content: `⏭️ Skippato. Prossimo: **${meta.title}** — sto per riprodurlo…`, ephemeral: true })
-        } catch {
-          await i.reply({ content: `⏭️ Skippato. Prossimo: **${nextItem.query}** — sto per riprodurlo…`, ephemeral: true })
-        }
+        // risolvi il titolo senza bloccare la risposta
+        resolveMeta(nextItem.query).then(meta=>{
+          // prova ad aggiornare il messaggio effimero
+          try { i.editReply({ content: `⏭️ Skippato. Prossimo: **${meta.title}** — sto per riprodurlo…` }) } catch {}
+        }).catch(()=>{})
       } else {
-        await i.reply({ content: '⏭️ Skippato. **Coda vuota**.', ephemeral: true })
+        try { await i.reply({ content: '⏭️ Skippato. **Coda vuota**.', flags: MessageFlags.Ephemeral }) } catch {}
       }
 
       await safeStopAll(i.guildId)
@@ -300,7 +308,8 @@ client.on('interactionCreate', async (i)=>{
       await safeStopAll(i.guildId)
       await upsertPanel(i.guildId,'idle')
       await upsertQueueMessage(i.guildId)
-      return void i.deferUpdate()
+      if (!i.deferred && !i.replied) await i.deferUpdate()
+      return
     }
     if (i.customId==='ctrl_disconnect'){
       const d = queues.get(i.guildId); if (d) d.queue.length = 0
@@ -308,33 +317,24 @@ client.on('interactionCreate', async (i)=>{
       const conn = getVoiceConnection(i.guildId); try { conn?.destroy() } catch {}
       await upsertPanel(i.guildId,'idle')
       await upsertQueueMessage(i.guildId)
-      return void i.deferUpdate()
+      if (!i.deferred && !i.replied) await i.deferUpdate()
+      return
     }
   } catch (e) {
     console.error('[interaction]', e)
-    if (!i.deferred && !i.replied) await i.deferUpdate()
+    if (!i.deferred && !i.replied) try { await i.deferUpdate() } catch {}
   }
 })
 
 client.on('messageCreate', async (m)=>{
   if (!m.guild || m.author.bot) return
-
-  // pulizia: se NON siamo nel canale consentito, cancella tutto subito
-  if (m.channelId !== ALLOWED_TEXT_CHANNEL_ID) {
-    try { await m.delete() } catch {}
-    return
-  }
-
-  // nel canale consentito: cancella TUTTO ciò che non è comando
-  if (!m.content.startsWith(PREFIX)){
-    try { await m.delete() } catch {}
-    return
-  }
+  if (m.channelId !== ALLOWED_TEXT_CHANNEL_ID) { try { await m.delete() } catch {} ; return }
+  if (!m.content.startsWith(PREFIX)){ try { await m.delete() } catch {} ; return }
 
   const parts = m.content.slice(PREFIX.length).trim().split(/\s+/)
   const cmd = (parts.shift()||'').toLowerCase()
   const args = parts.join(' ')
-  const data = ensureSession(m.guildId, m.channel)
+  ensureSession(m.guildId, m.channel)
 
   const zap = async ()=>{ try{ await m.delete() }catch{} }
 
@@ -344,11 +344,10 @@ client.on('messageCreate', async (m)=>{
     if (!q || !vc) return zap()
 
     const conn = getVoiceConnection(m.guildId) || joinVoiceChannel({
-      channelId: vc.id,
-      guildId: vc.guild.id,
-      adapterCreator: vc.guild.voiceAdapterCreator,
-      selfDeaf: true
+      channelId: vc.id, guildId: vc.guild.id,
+      adapterCreator: vc.guild.voiceAdapterCreator, selfDeaf: true
     })
+    const data = queues.get(m.guildId)
     conn.subscribe(data.player)
 
     data.queue.push({ query: q, requesterId: m.author.id, requesterTag: m.author.tag, channelId: vc.id, adapterCreator: m.guild.voiceAdapterCreator })
@@ -361,20 +360,10 @@ client.on('messageCreate', async (m)=>{
   if (cmd==='skip'){
     const d = queues.get(m.guildId)
     const nextItem = d?.queue?.[0]
-
-    if (nextItem) {
-      d.nextQuery = nextItem.query
-      await upsertPanel(m.guildId, 'search')
-    } else {
-      await upsertPanel(m.guildId, 'idle')
-    }
-
+    if (nextItem) { d.nextQuery = nextItem.query; await upsertPanel(m.guildId,'search') } else { await upsertPanel(m.guildId,'idle') }
     await safeStopAll(m.guildId)
-    if (queues.get(m.guildId)?.queue.length) {
-      playNext(m.guildId).catch(()=>{})
-    } else {
-      await upsertQueueMessage(m.guildId)
-    }
+    if (queues.get(m.guildId)?.queue.length) playNext(m.guildId).catch(()=>{})
+    else await upsertQueueMessage(m.guildId)
     return zap()
   }
 
@@ -395,7 +384,6 @@ client.on('messageCreate', async (m)=>{
     return zap()
   }
 
-  // altri comandi non previsti → elimina
   return zap()
 })
 
