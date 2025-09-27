@@ -1,4 +1,5 @@
-// robust24: fast search + cache + stable queue/skip cleanup
+\
+// robust24.1: instant placeholder + parallel join + fast search + cache + stable queue/skip cleanup
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 
@@ -14,7 +15,7 @@ const PREFIX = '!'
 const queues = new Map()
 const searchCache = new Map() // query -> {title,url}
 
-// Helpers
+// ---------- Helpers ----------
 function isUrl(str){ try { new URL(str); return true } catch { return false } }
 
 function killChildSafe(child){
@@ -22,23 +23,21 @@ function killChildSafe(child){
   try { child.stdin?.destroy() } catch {}
   try { child.stdout?.destroy() } catch {}
   try { child.stderr?.destroy() } catch {}
-  try { child.kill('SIGKILL') } catch {}
+  try { child.kill?.('SIGKILL') } catch {}
 }
 
 function ensureGuild(guildId, channel){
   if(!queues.has(guildId)){
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } })
     const data = { queue: [], player, textChannel: channel, currentProc: null, playing: false }
-    // Auto-next & cleanup on idle
+    // Auto-next & cleanup
     player.on(AudioPlayerStatus.Idle, () => {
       data.playing = false
-      // cleanup current processes if any
       if (data.currentProc){
         killChildSafe(data.currentProc.main)
         killChildSafe(data.currentProc.feeder)
         data.currentProc = null
       }
-      // next
       if (data.queue.length > 0) playNext(guildId).catch(e => console.error('playNext err:', e))
     })
     player.on('error', (e) => {
@@ -56,10 +55,9 @@ function ensureGuild(guildId, channel){
   return queues.get(guildId)
 }
 
-// ---- Search: ytsearch1 for speed + cache ----
+// ---------- Search: ytsearch1 for speed + cache ----------
 async function resolveYouTube(query){
   if (isUrl(query)){
-    // For URLs, still try to get a title+direct URL quickly
     return await resolveWithYtDlp(query, false)
   }
   const key = query.toLowerCase()
@@ -77,8 +75,7 @@ function resolveWithYtDlp(input, useSearch){
       '--get-title', '--get-url'
     ]
     if (useSearch){
-      // fastest: only first result
-      args.unshift('ytsearch1:'+input)
+      args.unshift('ytsearch1:'+input)     // fastest: only first result
     } else {
       args.push(input)
     }
@@ -96,7 +93,7 @@ function resolveWithYtDlp(input, useSearch){
   })
 }
 
-// ---- Playback pipelines ----
+// ---------- Playback pipelines ----------
 
 // Fast direct HTTP stream (WebM/Opus expected)
 function httpOpusStream(mediaUrl){
@@ -133,35 +130,61 @@ function transcodePipeline(urlOrQuery){
   return { proc: ffmpeg, feeder, stream: ffmpeg.stdout }
 }
 
+// ---------- Core playback with placeholder/edit ----------
 async function playNext(guildId){
   const data = queues.get(guildId); if (!data) return
-  if (data.playing) return // guard
+  if (data.playing) return
   const next = data.queue.shift()
   if (!next){ data.textChannel?.send('📭 Coda finita.'); return }
   data.playing = true
 
+  // placeholder message (create or fetch)
+  let msg = null
+  if (next.placeholderId){
+    try { msg = await data.textChannel.messages.fetch(next.placeholderId) } catch { msg = null }
+  }
+  if (!msg) msg = await data.textChannel.send(`⏳ Preparo: **${next.query}**`)
+
+  // Show “searching” if resolution takes > 1s
+  const slowTimer = setTimeout(() => {
+    if (msg && !msg.embeds?.length) msg.edit(`🔎 Sto cercando la versione più veloce di **${next.query}**...`)
+  }, 1000)
+
   try {
     const { url, title } = await resolveYouTube(next.query)
 
-    // try direct http (assumes opus/webm)
     let started = false
-    let current = null
-
+    // Fast path: direct HTTP Opus/WebM
     try {
       const httpStream = await httpOpusStream(url)
-      current = { main: { kill(){ try{httpStream.destroy()}catch{}} } } // placeholder for cleanup
-      data.currentProc = current
+      data.currentProc = { main: { kill(){ try{httpStream.destroy()}catch{} } } }
       const resource = createAudioResource(httpStream, { inputType: StreamType.WebmOpus })
-      data.player.once(AudioPlayerStatus.Playing, () => { started = true })
+      data.player.once(AudioPlayerStatus.Playing, async () => {
+        started = true
+        clearTimeout(slowTimer)
+        await msg.edit({ content: null, embeds: [
+          new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
+        ]})
+      })
       data.player.play(resource)
     } catch (e) {
-      console.warn('Direct HTTP stream failed quickly:', e.message)
+      // Direct failed immediately -> fallback now
+      const { proc, feeder, stream } = transcodePipeline(url)
+      data.currentProc = { main: proc, feeder }
+      const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
+      data.player.once(AudioPlayerStatus.Playing, async () => {
+        started = true
+        clearTimeout(slowTimer)
+        await msg.edit({ content: null, embeds: [
+          new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
+        ]})
+      })
+      data.player.play(resource)
     }
 
-    // fallback after short window if not started
+    // Safety fallback if still not started after 1.2s (e.g. HTTP stalled)
     setTimeout(() => {
       if (!started){
-        console.log('Falling back to ffmpeg path...')
         const { proc, feeder, stream } = transcodePipeline(url)
         data.currentProc = { main: proc, feeder }
         const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
@@ -169,18 +192,16 @@ async function playNext(guildId){
       }
     }, 1200)
 
-    const embed = new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
-    data.textChannel?.send({ embeds: [embed] })
   } catch (err) {
+    clearTimeout(slowTimer)
     console.error('playNext error:', err)
-    data.textChannel?.send(`⚠️ Errore con questo brano: ${err.message}`)
+    await msg.edit(`⚠️ Errore: ${err.message}`)
     data.playing = false
-    // go next
     if (data.queue.length > 0) playNext(guildId).catch(()=>{})
   }
 }
 
-// ---- Discord client ----
+// ---------- Discord client & commands ----------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -206,17 +227,21 @@ client.on('messageCreate', async (message) => {
     if (!query) return void message.reply('Uso: `!play <link YouTube o titolo>`')
     const vc = message.member.voice?.channel
     if (!vc) return void message.reply('Devi essere in un canale vocale 🎙️')
-    try {
-      const conn = getVoiceConnection(guildId) || await joinVoiceChannel({
-        channelId: vc.id, guildId: vc.guild.id, adapterCreator: vc.guild.voiceAdapterCreator, selfDeaf: true
-      })
-      conn.subscribe(data.player)
-      data.queue.push({ query, requestedBy: message.author.tag })
-      if (data.player.state.status === AudioPlayerStatus.Idle && !data.playing) playNext(guildId).catch(()=>{})
-      await message.reply(`🎶 Aggiunto in coda: **${query}**`)
-    } catch (e) {
-      console.error(e); await message.reply('❌ Non riesco a connettermi al canale vocale.')
-    }
+
+    // show typing + placeholder immediately
+    message.channel.sendTyping()
+    const placeholder = await message.reply(`⏳ Preparo: **${query}**`)
+
+    // join in parallel
+    const joinP = (async () => {
+      const existing = getVoiceConnection(guildId)
+      if (existing) return existing
+      return joinVoiceChannel({ channelId: vc.id, guildId: vc.guild.id, adapterCreator: vc.guild.voiceAdapterCreator, selfDeaf: true })
+    })()
+
+    // enqueue and kick playback if idle
+    data.queue.push({ query, requestedBy: message.author.tag, placeholderId: placeholder.id })
+    if (data.player.state.status === AudioPlayerStatus.Idle && !data.playing) playNext(guildId).catch(()=>{})
     return
   }
 
@@ -245,12 +270,10 @@ client.on('messageCreate', async (message) => {
   }
 
   if (command === 'queue'){
+    const rest = data.queue.map((q,i)=>`${i+1}. ${q.query}`).join('\n') || '—'
     if (data.playing){
-      const now = '🎧 in riproduzione'
-      const rest = data.queue.map((q,i)=>`${i+1}. ${q.query}`).join('\n') || '—'
-      return void message.reply(`**${now}**\nIn coda:\n${rest}`)
+      return void message.reply(`**🎧 in riproduzione**\nIn coda:\n${rest}`)
     } else {
-      const rest = data.queue.map((q,i)=>`${i+1}. ${q.query}`).join('\n') || '—'
       return void message.reply(`In coda:\n${rest}`)
     }
   }
