@@ -1,5 +1,5 @@
 \
-// robust25.3-stream: streaming immediato (yt-dlp stdout -> ffmpeg), UX con placeholder/edit, pipeline semplice e compatibile
+// robust25.3b-stream: streaming (yt-dlp -> stdout -> ffmpeg), UX con placeholder/edit
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 

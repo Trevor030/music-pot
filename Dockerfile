@@ -9,4 +9,8 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
 COPY . .
+
+# --- sanitize index.js first byte if it's stray "" or BOM ---
+RUN node -e "let fs=require('fs');let s=fs.readFileSync('index.js','utf8');if(s.charCodeAt(0)===0x5C||s.charCodeAt(0)===0xFEFF){fs.writeFileSync('index.js',s.slice(1));console.log('Sanitized leading char');}else{console.log('No sanitize needed')}"
+
 CMD ["node", "index.js"]
