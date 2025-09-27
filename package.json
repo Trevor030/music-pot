@@ -1,6 +1,6 @@
 {
   "name": "music-pot",
-  "version": "26.0.0-clean-chat",
+  "version": "26.1.0-clean-chat-progress",
   "description": "Discord Music Bot (clean chat, single panel/queue, WebM/Opus direct)",
   "main": "index.js",
   "type": "module",

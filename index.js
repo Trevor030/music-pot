@@ -1,5 +1,4 @@
-\
-// 26.0 clean-chat — single panel & single queue, auto-delete noise, WebM/Opus direct (no ffmpeg)
+// 26.1 clean-chat — single panel & single queue, auto-delete noise, WebM/Opus direct (no ffmpeg)
 import 'dotenv/config'
 import {
   Client, GatewayIntentBits,
@@ -131,28 +130,23 @@ async function upsertPanel(guildId, status='idle', extra={}){
   data.lastStatus = status
   const embed = panelEmbed(data, status, extra); const comps = panelButtons(status)
   try{
-    // prova ad aggiornare
     if (data.controlsMsgId){
       const m = await data.textChannel.messages.fetch(data.controlsMsgId).catch(()=>null)
       if (m){ await m.edit({ embeds:[embed], components: comps }); return }
       data.controlsMsgId = null
     }
-    // cerca un messaggio del bot da riusare
     const recent = await data.textChannel.messages.fetch({ limit: 30 }).catch(()=>null)
     if (recent){
       const mine = recent.find(msg => msg.author?.id === msg.client?.user?.id)
-      if (mine){ data.controlsMsgId = mine.id; await mine.edit({ embeds:[embed], components: comps }); 
-        // elimina duplicati residui
+      if (mine){ data.controlsMsgId = mine.id; await mine.edit({ embeds:[embed], components: comps });
         for (const m of recent.values()){
           if (m.id !== mine.id && m.author?.id === mine.author?.id) await m.delete().catch(()=>{})
         }
         return
       }
     }
-    // crea nuovo pannello
     const sent = await data.textChannel.send({ embeds:[embed], components: comps })
     data.controlsMsgId = sent.id
-    // elimina altri messaggi del bot
     if (recent){
       for (const m of recent.values()){
         if (m.id !== sent.id && m.author?.id === sent.author?.id) await m.delete().catch(()=>{})
