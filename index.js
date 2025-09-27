@@ -1,4 +1,4 @@
-// robust24.2: instant placeholder + parallel join + fast search (ytsearch1) + cache + stable queue/skip cleanup
+// robust24.3: reliable path (yt-dlp -> ffmpeg -> Ogg/Opus), fast search (ytsearch1), cache, placeholder, stable queue/skip cleanup
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 
@@ -8,7 +8,6 @@ import {
   AudioPlayerStatus, getVoiceConnection, StreamType
 } from '@discordjs/voice'
 import { spawn } from 'child_process'
-import https from 'https'
 
 const PREFIX = '!'
 const queues = new Map()
@@ -70,7 +69,7 @@ function resolveWithYtDlp(input, useSearch){
   return new Promise((resolve, reject) => {
     const args = [
       '--no-playlist', '--no-progress', '--force-ipv4',
-      '-f', 'bestaudio[acodec=opus]/bestaudio',
+      '-f', 'bestaudio',
       '--get-title', '--get-url'
     ]
     if (useSearch){
@@ -92,24 +91,7 @@ function resolveWithYtDlp(input, useSearch){
   })
 }
 
-// ---------- Playback pipelines ----------
-
-// Fast direct HTTP stream (WebM/Opus expected)
-function httpOpusStream(mediaUrl){
-  const agent = new https.Agent({ keepAlive: true, maxSockets: 6 })
-  return new Promise((resolve, reject) => {
-    const req = https.get(mediaUrl, { agent, headers: {
-      'User-Agent': 'Mozilla/5.0 (DiscordMusicBot)',
-      'Accept': '*/*', 'Connection': 'keep-alive'
-    }}, (res) => {
-      if (res.statusCode !== 200) return reject(new Error('HTTP '+res.statusCode))
-      resolve(res)
-    })
-    req.on('error', reject)
-  })
-}
-
-// Fallback: yt-dlp -> ffmpeg (ogg/opus)
+// ---------- Playback: yt-dlp -> ffmpeg (ogg/opus) ----------
 function transcodePipeline(urlOrQuery){
   const feeder = spawn('yt-dlp', ['-f','bestaudio','--no-playlist','-o','-', urlOrQuery], { stdio: ['ignore','pipe','pipe'] })
   feeder.stderr.on('data', d => console.error('[yt-dlp]', d.toString()))
@@ -129,7 +111,7 @@ function transcodePipeline(urlOrQuery){
   return { proc: ffmpeg, feeder, stream: ffmpeg.stdout }
 }
 
-// ---------- Core playback with placeholder/edit ----------
+// ---------- Core playback ----------
 async function playNext(guildId){
   const data = queues.get(guildId); if (!data) return
   if (data.playing) return
@@ -152,44 +134,16 @@ async function playNext(guildId){
   try {
     const { url, title } = await resolveYouTube(next.query)
 
-    let started = false
-    // Fast path: direct HTTP Opus/WebM
-    try {
-      const httpStream = await httpOpusStream(url)
-      data.currentProc = { main: { kill(){ try{httpStream.destroy()}catch{} } } }
-      const resource = createAudioResource(httpStream, { inputType: StreamType.WebmOpus })
-      data.player.once(AudioPlayerStatus.Playing, async () => {
-        started = true
-        clearTimeout(slowTimer)
-        await msg.edit({ content: null, embeds: [
-          new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
-        ]})
-      })
-      data.player.play(resource)
-    } catch (e) {
-      // Direct failed immediately -> fallback now
-      const { proc, feeder, stream } = transcodePipeline(url)
-      data.currentProc = { main: proc, feeder }
-      const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
-      data.player.once(AudioPlayerStatus.Playing, async () => {
-        started = true
-        clearTimeout(slowTimer)
-        await msg.edit({ content: null, embeds: [
-          new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
-        ]})
-      })
-      data.player.play(resource)
-    }
-
-    // Safety fallback if still not started after 1.2s (e.g. HTTP stalled)
-    setTimeout(() => {
-      if (!started){
-        const { proc, feeder, stream } = transcodePipeline(url)
-        data.currentProc = { main: proc, feeder }
-        const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
-        data.player.play(resource)
-      }
-    }, 1200)
+    const { proc, feeder, stream } = transcodePipeline(url)
+    data.currentProc = { main: proc, feeder }
+    const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
+    data.player.once(AudioPlayerStatus.Playing, async () => {
+      clearTimeout(slowTimer)
+      await msg.edit({ content: null, embeds: [
+        new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
+      ]})
+    })
+    data.player.play(resource)
 
   } catch (err) {
     clearTimeout(slowTimer)
