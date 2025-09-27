@@ -1,8 +1,8 @@
-// 26.1 clean-chat — single panel & single queue, auto-delete noise, WebM/Opus direct (no ffmpeg)
+// 26.1-fix2 — clean chat, single panel/queue, race-free queue/skip, locked channel, no pause/queue, disconnect button
 import 'dotenv/config'
 import {
   Client, GatewayIntentBits,
-  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle
+  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionsBitField
 } from 'discord.js'
 import {
   joinVoiceChannel, createAudioPlayer, createAudioResource,
@@ -12,6 +12,7 @@ import { spawn } from 'child_process'
 
 const PREFIX = '!'
 const PROGRESS_INTERVAL_MS = Number(process.env.PROGRESS_INTERVAL_MS || 3000)
+const ALLOWED_TEXT_CHANNEL_ID = '1421488309456208117'
 
 const queues = new Map() // guildId -> session
 
@@ -36,27 +37,39 @@ function ensureSession(guildId, channel){
       lastStatus: 'idle', lastError: null,
       resource: null, durationSec: null,
       progressTimer: null, nextQuery: null,
-      requesterId: null, requesterTag: null
+      requesterId: null, requesterTag: null,
+      advancing: false
     }
     player.on(AudioPlayerStatus.Idle, ()=>{
-      data.playing = false
-      clearInterval(data.progressTimer); data.progressTimer = null
-      data.resource = null; data.durationSec = null; data.nowTitle = null
-      if (data.queue.length) playNext(guildId).catch(()=>{})
-      else upsertPanel(guildId, 'idle')
+      const d = queues.get(guildId); if(!d) return
+      stopTimers(d)
+      if (!d.advancing) playNext(guildId).catch(()=>{})
     })
     player.on('error', (e)=>{
       console.error('[player]', e)
-      data.playing=false
-      clearInterval(data.progressTimer); data.progressTimer = null
-      data.lastError = e?.message || 'Errore player'
-      upsertPanel(guildId, 'error', { message: data.lastError })
-      if (data.queue.length) playNext(guildId).catch(()=>{})
+      const d = queues.get(guildId); if(!d) return
+      stopTimers(d); killCurrent(d)
+      d.lastError = e?.message || 'Errore player'
+      upsertPanel(guildId, 'error', { message: d.lastError })
+      if (!d.advancing && d.queue.length) playNext(guildId).catch(()=>{})
     })
     queues.set(guildId, data)
   }
-  return queues.get(guildId)
+  const d = queues.get(guildId)
+  if (channel && channel.id === ALLOWED_TEXT_CHANNEL_ID) d.textChannel = channel // tieni canale coerente
+  return d
 }
+
+// --- helpers ---
+function stopTimers(data){ try { clearInterval(data.progressTimer) } catch {} ; data.progressTimer=null }
+function killCurrent(data){
+  try{ data.player.stop(true) }catch{}
+  try{ data.resource?.playStream?.destroy?.() }catch{}
+  try{ data.resource?.audioPlayer?.stop?.() }catch{}
+  try{ data.current?.proc?.kill?.('SIGKILL') }catch{}
+  data.current=null; data.resource=null
+}
+async function safeStopAll(guildId){ const d=queues.get(guildId); if(!d) return; stopTimers(d); killCurrent(d); d.playing=false }
 
 // --- yt-dlp helpers ---
 function resolveMeta(input){
@@ -92,7 +105,7 @@ function panelEmbed(data, status='idle', extra={}){
   const e = new EmbedBuilder().setColor(THEME)
   if (status==='idle'){
     e.setTitle('Now Playing — nessuna traccia')
-    e.setDescription('Usa `!play <link|titolo>`')
+    e.setDescription('Usa `!play <link|titolo>` nel canale consentito.')
   } else if (status==='search'){
     e.setTitle('🔎 Sto preparando il brano…')
     e.setDescription(`Richiesta: \`${data.nextQuery || data.queue[0]?.query || '—'}\``)
@@ -115,13 +128,10 @@ function panelEmbed(data, status='idle', extra={}){
   return e
 }
 function panelButtons(status='idle'){
-  const playing = status==='playing'
   return [ new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ctrl_pause').setEmoji('⏸️').setStyle(ButtonStyle.Secondary).setDisabled(!playing),
-    new ButtonBuilder().setCustomId('ctrl_resume').setEmoji('▶️').setStyle(ButtonStyle.Secondary).setDisabled(playing),
-    new ButtonBuilder().setCustomId('ctrl_skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(!playing),
+    new ButtonBuilder().setCustomId('ctrl_skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(status!=='playing'),
     new ButtonBuilder().setCustomId('ctrl_stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId('ctrl_queue').setEmoji('🧭').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('ctrl_disconnect').setEmoji('🔌').setStyle(ButtonStyle.Secondary)
   ) ]
 }
 
@@ -179,15 +189,27 @@ async function upsertQueueMessage(guildId){
 // --- Core playback ---
 async function playNext(guildId){
   const data = queues.get(guildId); if (!data) return
-  const next = data.queue.shift()
-  if (!next){ await upsertPanel(guildId,'idle'); await upsertQueueMessage(guildId); return }
-  data.nextQuery = next.query
-  data.requesterId = next.requesterId; data.requesterTag = next.requesterTag
+  if (data.advancing) return
+  data.advancing = true
 
-  await upsertPanel(guildId,'search')
+  try {
+    stopTimers(data); killCurrent(data)
 
-  try{
-    const meta = await resolveMeta(next.query)
+    const next = data.queue.shift()
+    if (!next) {
+      data.playing = false
+      await upsertPanel(guildId, 'idle')
+      await upsertQueueMessage(guildId)
+      return
+    }
+
+    data.nextQuery = next.query
+    data.requesterId = next.requesterId; data.requesterTag = next.requesterTag
+
+    await upsertPanel(guildId,'search')
+
+    let meta = { title: next.query, uploader: 'YouTube', durationSec: null }
+    try { meta = await resolveMeta(next.query) } catch {}
     data.nowTitle = meta.title
     data.uploader = meta.uploader
     data.durationSec = meta.durationSec
@@ -205,22 +227,25 @@ async function playNext(guildId){
 
     const resource = createAudioResource(stream, { inputType: StreamType.WebmOpus })
     data.resource = resource
+    data.playing = true
 
     data.player.once(AudioPlayerStatus.Playing, async ()=>{
       await upsertPanel(guildId,'playing')
-      clearInterval(data.progressTimer)
+      stopTimers(data)
       data.progressTimer = setInterval(()=>{
         if (data.player.state.status === AudioPlayerStatus.Playing) upsertPanel(guildId,'playing')
       }, PROGRESS_INTERVAL_MS)
     })
     data.player.play(resource)
-  }catch(e){
+  } catch (e) {
     console.error('[playNext]', e)
     data.lastError = e?.message || 'Ricerca/stream falliti'
     await upsertPanel(guildId, 'error', { message: data.lastError })
-    if (data.queue.length) playNext(guildId).catch(()=>{})
+    if (data.queue.length) { try { await playNext(guildId) } catch {} }
+    else { data.playing = false }
   } finally {
     await upsertQueueMessage(guildId)
+    data.advancing = false
   }
 }
 
@@ -240,13 +265,33 @@ client.once('ready', ()=>{
 client.on('interactionCreate', async (i)=>{
   if (!i.isButton()) return
   const data = queues.get(i.guildId); if(!data) return void i.deferUpdate()
-  try{
-    if (i.customId==='ctrl_pause'){ data.player.pause(true); clearInterval(data.progressTimer); data.progressTimer=null; await upsertPanel(i.guildId,'idle'); await i.deferUpdate(); return }
-    if (i.customId==='ctrl_resume'){ data.player.unpause(); await upsertPanel(i.guildId,'playing'); await i.deferUpdate(); return }
-    if (i.customId==='ctrl_skip'){ data.player.stop(true); try{ data.current?.proc?.kill('SIGKILL') }catch{}; clearInterval(data.progressTimer); data.progressTimer=null; if (data.queue.length) playNext(i.guildId).catch(()=>{}); await upsertPanel(i.guildId,'idle'); await upsertQueueMessage(i.guildId); await i.deferUpdate(); return }
-    if (i.customId==='ctrl_stop'){ data.queue.length=0; data.player.stop(true); try{ data.current?.proc?.kill('SIGKILL') }catch{}; clearInterval(data.progressTimer); data.progressTimer=null; await upsertPanel(i.guildId,'idle'); await upsertQueueMessage(i.guildId); await i.deferUpdate(); return }
-    if (i.customId==='ctrl_queue'){ await upsertQueueMessage(i.guildId); await i.deferUpdate(); return }
-  }catch(e){
+  // blocca interazioni se non provengono dal canale autorizzato
+  if (i.channelId !== ALLOWED_TEXT_CHANNEL_ID) return void i.deferUpdate()
+
+  try {
+    if (i.customId==='ctrl_skip'){
+      await safeStopAll(i.guildId)
+      await upsertPanel(i.guildId,'idle')
+      await upsertQueueMessage(i.guildId)
+      if (queues.get(i.guildId)?.queue.length) playNext(i.guildId).catch(()=>{})
+      return void i.deferUpdate()
+    }
+    if (i.customId==='ctrl_stop'){
+      const d = queues.get(i.guildId); if (d) d.queue.length = 0
+      await safeStopAll(i.guildId)
+      await upsertPanel(i.guildId,'idle')
+      await upsertQueueMessage(i.guildId)
+      return void i.deferUpdate()
+    }
+    if (i.customId==='ctrl_disconnect'){
+      const d = queues.get(i.guildId); if (d) d.queue.length = 0
+      await safeStopAll(i.guildId)
+      const conn = getVoiceConnection(i.guildId); try { conn?.destroy() } catch {}
+      await upsertPanel(i.guildId,'idle')
+      await upsertQueueMessage(i.guildId)
+      return void i.deferUpdate()
+    }
+  } catch (e) {
     console.error('[interaction]', e)
     if (!i.deferred && !i.replied) await i.deferUpdate()
   }
@@ -255,7 +300,13 @@ client.on('interactionCreate', async (i)=>{
 client.on('messageCreate', async (m)=>{
   if (!m.guild || m.author.bot) return
 
-  // Modalità CLEAN: cancella tutto ciò che non è comando
+  // pulizia: se NON siamo nel canale consentito, cancella tutto subito
+  if (m.channelId !== ALLOWED_TEXT_CHANNEL_ID) {
+    try { await m.delete() } catch {}
+    return
+  }
+
+  // nel canale consentito: cancella TUTTO ciò che non è comando
   if (!m.content.startsWith(PREFIX)){
     try { await m.delete() } catch {}
     return
@@ -288,13 +339,32 @@ client.on('messageCreate', async (m)=>{
     return zap()
   }
 
-  if (cmd==='skip'){ data.player.stop(true); try{ data.current?.proc?.kill('SIGKILL') }catch{}; clearInterval(data.progressTimer); data.progressTimer=null; await upsertPanel(m.guildId,'idle'); await upsertQueueMessage(m.guildId); return zap() }
-  if (cmd==='stop'){ data.queue.length=0; data.player.stop(true); try{ data.current?.proc?.kill('SIGKILL') }catch{}; clearInterval(data.progressTimer); data.progressTimer=null; await upsertPanel(m.guildId,'idle'); await upsertQueueMessage(m.guildId); return zap() }
-  if (cmd==='pause'){ data.player.pause(true); clearInterval(data.progressTimer); data.progressTimer=null; await upsertPanel(m.guildId,'idle'); return zap() }
-  if (cmd==='resume'){ data.player.unpause(); await upsertPanel(m.guildId,'playing'); return zap() }
-  if (cmd==='queue'){ await upsertQueueMessage(m.guildId); return zap() }
+  if (cmd==='skip'){
+    await safeStopAll(m.guildId)
+    await upsertPanel(m.guildId,'idle')
+    await upsertQueueMessage(m.guildId)
+    if (queues.get(m.guildId)?.queue.length) playNext(m.guildId).catch(()=>{})
+    return zap()
+  }
 
-  // Comando non valido → elimina senza rispondere
+  if (cmd==='stop'){
+    const d = queues.get(m.guildId); if (d) d.queue.length = 0
+    await safeStopAll(m.guildId)
+    await upsertPanel(m.guildId,'idle')
+    await upsertQueueMessage(m.guildId)
+    return zap()
+  }
+
+  if (cmd==='disconnect'){
+    const d = queues.get(m.guildId); if (d) d.queue.length = 0
+    await safeStopAll(m.guildId)
+    const conn = getVoiceConnection(m.guildId); try { conn?.destroy() } catch {}
+    await upsertPanel(m.guildId,'idle')
+    await upsertQueueMessage(m.guildId)
+    return zap()
+  }
+
+  // altri comandi non previsti → elimina
   return zap()
 })
 
