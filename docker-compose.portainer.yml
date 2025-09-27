@@ -8,3 +8,7 @@ services:
     environment:
       DISCORD_TOKEN: "${DISCORD_TOKEN}"
       PROGRESS_INTERVAL_MS: "3000"
+      IDLE_MINUTES: "30"
+      ALLOWED_TEXT_CHANNEL_ID: "1421488309456208117"
+      # opzionale se vuoi usare Android con PO token
+      # ANDROID_PO_TOKEN: "android.gvs+XXXX"

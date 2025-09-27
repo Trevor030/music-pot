@@ -1,4 +1,4 @@
-// 26.1-fix3.3 — yt-dlp Android client + itags 251/250/249, single panel mutex, keep queue, fast skip feedback
+// 26.1-fix3.4 — idle cleanup + yt-dlp client fallback (android/ios/web) + single panel mutex + keep queue
 import 'dotenv/config'
 import {
   Client, GatewayIntentBits,
@@ -12,7 +12,9 @@ import { spawn } from 'child_process'
 
 const PREFIX = '!'
 const PROGRESS_INTERVAL_MS = Number(process.env.PROGRESS_INTERVAL_MS || 3000)
-const ALLOWED_TEXT_CHANNEL_ID = '1421488309456208117'
+const IDLE_MINUTES = Number(process.env.IDLE_MINUTES || 30)
+const ALLOWED_TEXT_CHANNEL_ID = process.env.ALLOWED_TEXT_CHANNEL_ID || '1421488309456208117'
+const ANDROID_PO_TOKEN = process.env.ANDROID_PO_TOKEN || '' // opzionale per android
 
 const queues = new Map() // guildId -> session
 
@@ -24,6 +26,7 @@ const progressBar = (pos=0,dur=0,w=20)=>{
   return `${'─'.repeat(i)}🔘${'─'.repeat(w-1-i)}`
 }
 const isUrl = (s)=>{ try{ new URL(s); return true }catch{ return false } }
+const wait = (ms)=> new Promise(r=>setTimeout(r,ms))
 
 function ensureSession(guildId, channel){
   if(!queues.has(guildId)){
@@ -39,7 +42,8 @@ function ensureSession(guildId, channel){
       progressTimer: null, nextQuery: null,
       requesterId: null, requesterTag: null,
       advancing: false,
-      panelUpdating: false  // mutex pannello
+      panelUpdating: false,  // mutex pannello
+      idleTimer: null
     }
     player.on(AudioPlayerStatus.Idle, ()=>{
       const d = queues.get(guildId); if(!d) return
@@ -62,7 +66,6 @@ function ensureSession(guildId, channel){
 }
 
 // --- helpers ---
-function wait(ms){ return new Promise(r=>setTimeout(r,ms)) }
 function stopTimers(data){ try { clearInterval(data.progressTimer) } catch {} ; data.progressTimer=null }
 function killCurrent(data){
   try{ data.player.stop(true) }catch{}
@@ -73,39 +76,109 @@ function killCurrent(data){
 }
 async function safeStopAll(guildId){ const d=queues.get(guildId); if(!d) return; stopTimers(d); killCurrent(d); d.playing=false }
 
-// --- yt-dlp helpers ---
-function resolveMeta(input){
+function cancelIdleTimer(data){ try { clearTimeout(data.idleTimer) } catch {} ; data.idleTimer=null }
+async function scheduleIdleCleanup(guildId){
+  const data = queues.get(guildId); if (!data) return
+  cancelIdleTimer(data)
+  if (!IDLE_MINUTES || IDLE_MINUTES <= 0) return
+  data.idleTimer = setTimeout(async ()=>{
+    try{
+      data.queue.length = 0
+      await safeStopAll(guildId)
+      const conn = getVoiceConnection(guildId); try { conn?.destroy() } catch {}
+
+      if (data.textChannel?.id === ALLOWED_TEXT_CHANNEL_ID) {
+        try {
+          const recent = await data.textChannel.messages.fetch({ limit: 100 })
+          const mine = [...recent.values()].filter(m => m.author?.id === m.client?.user?.id)
+          for (const m of mine) await m.delete().catch(()=>{})
+        } catch {}
+      }
+      data.controlsMsgId = null
+      data.queueMsgId = null
+      data.nowTitle = null
+      data.durationSec = null
+      data.playing = false
+      console.log('[idle-cleanup] Guild', guildId, 'cleanup completato')
+    }catch(e){ console.error('[idle-cleanup]', e) }
+  }, IDLE_MINUTES*60*1000)
+}
+
+// --- yt-dlp meta/stream with client fallback ---
+function buildExtractorArgs(client){
+  if (client === 'android' && ANDROID_PO_TOKEN) {
+    return `youtube:player_client=android,po_token=${ANDROID_PO_TOKEN}`
+  }
+  if (client === 'android') return 'youtube:player_client=android' // tenterà senza PO token
+  if (client === 'ios') return 'youtube:player_client=ios'
+  return '' // web di default (nessun extractor-args)
+}
+
+function ytdlpJson(query, client){
   return new Promise((resolve) => {
-    const query = isUrl(input) ? input : ('ytsearch1:'+input)
-    const p = spawn('yt-dlp', [
-      '-J', '--no-playlist',
-      '--extractor-args','youtube:player_client=android',
-      '--', query
-    ], { stdio: ['ignore','pipe','pipe'] })
+    const args = ['-J','--no-playlist']
+    const extractor = buildExtractorArgs(client)
+    if (extractor) { args.push('--extractor-args', extractor) }
+    args.push('--', query)
+    const p = spawn('yt-dlp', args, { stdio: ['ignore','pipe','pipe'] })
     let out=''; p.stdout.on('data', d => out += d.toString())
-    p.on('close', ()=>{
+    let err=''; p.stderr.on('data', d => err += d.toString())
+    p.on('close', (code)=> resolve({ code, out, err }))
+  })
+}
+
+async function resolvePlayableClient(input){
+  const query = isUrl(input) ? input : ('ytsearch1:'+input)
+  const clients = ['android','ios','web']
+  const formats = ['251/250/249','bestaudio']
+
+  for (const client of clients){
+    for (const fmt of formats){
+      const args = ['-f', fmt, '-J','--no-playlist']
+      const extractor = buildExtractorArgs(client)
+      if (extractor) { args.push('--extractor-args', extractor) }
+      args.push('--', query)
+      const p = spawn('yt-dlp', args, { stdio: ['ignore','pipe','pipe'] })
+      let out='', err=''
+      p.stdout.on('data', d => out += d.toString())
+      p.stderr.on('data', d => err += d.toString())
+      const code = await new Promise(res=> p.on('close', res))
+      if (code === 0 && !/Requested format is not available/i.test(err)) {
+        return { client, fmt }
+      }
+    }
+  }
+  // fallback finale
+  return { client: 'web', fmt: 'bestaudio' }
+}
+
+async function resolveMeta(input){
+  const query = isUrl(input) ? input : ('ytsearch1:'+input)
+  // prova client in fallback solo per i metadati
+  const order = ['android','ios','web']
+  for (const client of order){
+    const { code, out } = await ytdlpJson(query, client)
+    if (code === 0) {
       try{
         const j = JSON.parse(out||'{}')
         const info = Array.isArray(j.entries) ? j.entries?.[0] : j
         const title = capFirst(info?.title || input)
         const uploader = info?.uploader || info?.channel || 'YouTube'
         const durationSec = Number(info?.duration) || null
-        resolve({ title, uploader, durationSec, url: input })
-      }catch{
-        resolve({ title: capFirst(input), uploader:'YouTube', durationSec:null, url: input })
-      }
-    })
-  })
+        return { title, uploader, durationSec, url: input }
+      }catch{}
+    }
+  }
+  return { title: capFirst(input), uploader:'YouTube', durationSec:null, url: input }
 }
 
-function streamWebmOpus(input){
+async function streamForInput(input){
   const query = isUrl(input) ? input : ('ytsearch1:'+input)
-  const args = [
-    '-f','251/250/249',                 // priorità Opus: 251>250>249
-    '--no-playlist',
-    '--extractor-args','youtube:player_client=android',
-    '-o','-','--', query
-  ]
+  const pick = await resolvePlayableClient(input)
+  const args = ['-f', pick.fmt, '--no-playlist']
+  const extractor = buildExtractorArgs(pick.client)
+  if (extractor) { args.push('--extractor-args', extractor) }
+  args.push('-o','-','--', query)
   const proc = spawn('yt-dlp', args, { stdio:['ignore','pipe','pipe'] })
   proc.stderr.on('data', d => console.error('[yt-dlp]', d.toString().trim()))
   return { proc, stream: proc.stdout }
@@ -222,6 +295,7 @@ async function playNext(guildId){
       data.playing = false
       await upsertPanel(guildId, 'idle')
       await upsertQueueMessage(guildId)
+      await scheduleIdleCleanup(guildId)
       return
     }
 
@@ -236,7 +310,7 @@ async function playNext(guildId){
     data.uploader = meta.uploader
     data.durationSec = meta.durationSec
 
-    const { proc, stream } = streamWebmOpus(next.query)
+    const { proc, stream } = await streamForInput(next.query)
     data.current = { proc }
 
     const conn = getVoiceConnection(guildId) || joinVoiceChannel({
@@ -252,6 +326,7 @@ async function playNext(guildId){
     data.playing = true
 
     data.player.once(AudioPlayerStatus.Playing, async ()=>{
+      cancelIdleTimer(data)
       await upsertPanel(guildId,'playing')
       stopTimers(data)
       data.progressTimer = setInterval(()=>{
@@ -264,7 +339,7 @@ async function playNext(guildId){
     data.lastError = e?.message || 'Ricerca/stream falliti'
     await upsertPanel(guildId, 'error', { message: data.lastError })
     if (data.queue.length) { try { await playNext(guildId) } catch {} }
-    else { data.playing = false }
+    else { data.playing = false; await scheduleIdleCleanup(guildId) }
   } finally {
     await upsertQueueMessage(guildId)
     data.advancing = false
@@ -279,7 +354,7 @@ const client = new Client({ intents: [
   GatewayIntentBits.MessageContent
 ]})
 
-client.once('ready', ()=>{
+client.once('clientReady', ()=>{
   console.log(`🤖 Online come ${client.user.tag}`)
   client.user.setPresence({ activities:[{ name:`instance ${process.pid}`, type:0 }], status:'online' })
 })
@@ -311,6 +386,7 @@ client.on('interactionCreate', async (i)=>{
       } else {
         await upsertPanel(i.guildId,'idle')
         await upsertQueueMessage(i.guildId)
+        await scheduleIdleCleanup(i.guildId)
       }
       return
     }
@@ -319,6 +395,7 @@ client.on('interactionCreate', async (i)=>{
       await safeStopAll(i.guildId)
       await upsertPanel(i.guildId,'idle')
       await upsertQueueMessage(i.guildId)
+      await scheduleIdleCleanup(i.guildId)
       if (!i.deferred && !i.replied) await i.deferUpdate()
       return
     }
@@ -328,6 +405,7 @@ client.on('interactionCreate', async (i)=>{
       const conn = getVoiceConnection(i.guildId); try { conn?.destroy() } catch {}
       await upsertPanel(i.guildId,'idle')
       await upsertQueueMessage(i.guildId)
+      await scheduleIdleCleanup(i.guildId)
       if (!i.deferred && !i.replied) await i.deferUpdate()
       return
     }
@@ -362,6 +440,7 @@ client.on('messageCreate', async (m)=>{
     conn.subscribe(data.player)
 
     data.queue.push({ query: q, requesterId: m.author.id, requesterTag: m.author.tag, channelId: vc.id, adapterCreator: m.guild.voiceAdapterCreator })
+    cancelIdleTimer(data)
     if (data.player.state.status === AudioPlayerStatus.Idle && !data.playing) playNext(m.guildId).catch(()=>{})
     await upsertPanel(m.guildId,'search')
     await upsertQueueMessage(m.guildId)
@@ -374,7 +453,7 @@ client.on('messageCreate', async (m)=>{
     if (nextItem) { d.nextQuery = nextItem.query; await upsertPanel(m.guildId,'search') } else { await upsertPanel(m.guildId,'idle') }
     await safeStopAll(m.guildId)
     if (queues.get(m.guildId)?.queue.length) playNext(m.guildId).catch(()=>{})
-    else await upsertQueueMessage(m.guildId)
+    else { await upsertQueueMessage(m.guildId); await scheduleIdleCleanup(m.guildId) }
     return zap()
   }
 
@@ -383,6 +462,7 @@ client.on('messageCreate', async (m)=>{
     await safeStopAll(m.guildId)
     await upsertPanel(m.guildId,'idle')
     await upsertQueueMessage(m.guildId)
+    await scheduleIdleCleanup(m.guildId)
     return zap()
   }
 
@@ -392,6 +472,7 @@ client.on('messageCreate', async (m)=>{
     const conn = getVoiceConnection(m.guildId); try { conn?.destroy() } catch {}
     await upsertPanel(m.guildId,'idle')
     await upsertQueueMessage(m.guildId)
+    await scheduleIdleCleanup(m.guildId)
     return zap()
   }
 
