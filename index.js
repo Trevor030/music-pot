@@ -1,273 +1,220 @@
-\
-// 26.0-minigui-status-progress-counter
-// - Pannello unico (search/playing/error)
-// - Anti-duplicazione pannello
-// - Barra progressiva LIVE (aggiornamento periodico)
-// - Capitalizzazione prima lettera titolo
-// - Contatore tempo: trascorso e rimanente (niente controlli volume)
-import 'dotenv/config'
-import sodium from 'libsodium-wrappers'; await sodium.ready
-
-import { 
+import {
   Client, GatewayIntentBits,
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle
-} from 'discord.js'
+} from "discord.js";
 import {
-  joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior,
-  AudioPlayerStatus, getVoiceConnection, StreamType
-} from '@discordjs/voice'
-import { spawn } from 'child_process'
+  joinVoiceChannel, createAudioPlayer,
+  createAudioResource, AudioPlayerStatus
+} from "@discordjs/voice";
+import { spawn } from "child_process";
 
-const PREFIX = '!'
-const DELETE_COMMANDS = (process.env.DELETE_COMMANDS || 'true').toLowerCase() === 'true'
-const PROGRESS_INTERVAL_MS = Number(process.env.PROGRESS_INTERVAL_MS || 5000) // refresh pannello
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
+});
 
-const queues = new Map()
+const PREFIX = "!";
+const queue = new Map();
+const PROGRESS_INTERVAL_MS = process.env.PROGRESS_INTERVAL_MS
+  ? parseInt(process.env.PROGRESS_INTERVAL_MS)
+  : 3000;
 
-// Tema + emoji
-const THEME = { color: Number(process.env.THEME_COLOR || 0xED4245) }
-const EMO = { prev:'⏮️', pause:'⏸️', play:'▶️', stop:'⏹️', skip:'⏭️', search:'🔎', err:'❌', list:'🧭', timer:'⏱️' }
-
-const capFirst = (s) => { s = String(s||'').trim(); return s ? s[0].toUpperCase()+s.slice(1) : s }
-const fmtDur = (sec) => { if(sec==null) return '—'; sec=Math.max(0, Math.floor(sec)); const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60; return h?`${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${m}:${String(s).padStart(2,'0')}` }
-function progressBar(pos=0, dur=0, width=20){
-  if(!dur || dur<=0) return '―'.repeat(width)
-  const p = Math.max(0, Math.min(1, pos/dur)); const i = Math.max(0, Math.min(width-1, Math.round(p*(width-1))))
-  const left = '─'.repeat(i), right = '─'.repeat(width-1-i)
-  return `${left}🔘${right}`
+// Capitalizza prima lettera
+function capFirst(s) {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+// Format mm:ss
+function fmtDur(sec) {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+// Barra progressiva
+function progressBar(pos, dur, size = 20) {
+  if (dur <= 0) return "🔘" + "─".repeat(size - 1);
+  const p = Math.floor((pos / dur) * size);
+  return "─".repeat(p) + "🔘" + "─".repeat(size - p - 1);
 }
 
-function ensureGuild(guildId, channel){
-  if(!queues.has(guildId)){
-    const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } })
-    const data = { 
-      queue: [], player, textChannel: channel, current: null, playing: false,
-      nowTitle: null, controlsMsgId: null, uploader: null,
-      requesterId: null, requesterTag: null, lastStatus: 'idle', lastError: null,
-      resource: null, durationSec: null, progressTimer: null, nextQuery: null
-    }
-    player.on(AudioPlayerStatus.Idle, () => {
-      data.playing = false; clearInterval(data.progressTimer); data.progressTimer = null
-      cleanup(data); upsertPanel(channel.guild.id, 'idle')
-      if (data.queue.length) playNext(channel.guild.id).catch(()=>{})
-    })
-    player.on('error', e => {
-      console.error('[player]', e); data.playing=false; clearInterval(data.progressTimer); data.progressTimer = null
-      cleanup(data); data.lastError = e?.message || 'Errore player'
-      upsertPanel(channel.guild.id, 'error', { message: data.lastError })
-      if (data.queue.length) playNext(channel.guild.id).catch(()=>{})
-    })
-    queues.set(guildId, data)
-  }
-  return queues.get(guildId)
-}
-
-function cleanup(data){
-  try{ data.current?.feeder?.kill('SIGKILL') }catch{}
-  try{ data.current?.proc?.kill('SIGKILL') }catch{}
-  data.current = null
-  data.resource = null
-  data.durationSec = null
-}
-
-function isUrl(s){ try{ new URL(s); return true } catch { return false } }
-
-function resolveMeta(input){
+// 🔎 Recupera metadati
+function resolveMeta(input) {
   return new Promise((resolve) => {
-    const query = isUrl(input) ? input : ('ytsearch1:'+input)
-    const args = ['--no-playlist','-f','ba[acodec=opus]/ba/bestaudio','--get-title','--get-uploader','--get-duration']
-    const p = spawn('yt-dlp', [...args, query], { stdio: ['ignore','pipe','pipe'] })
-    let out = ''; p.stdout.on('data', d => out += d.toString())
-    p.on('close', () => {
-      const lines = out.trim().split('\n')
-      const title = capFirst(lines[0] || input)
-      const uploader = lines[1] || 'YouTube'
-      const durStr = lines[2] || null
-      const durationSec = durStr ? durStr.split(':').reduce((acc,v)=>acc*60+Number(v||0),0) : null
-      resolve({ title, uploader, durationSec })
-    })
-  })
+    const query = /^https?:\/\//.test(input) ? input : `ytsearch1:${input}`;
+    const p = spawn("yt-dlp", ["-J", "--no-playlist", "--", query]);
+
+    let out = "";
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.on("close", () => {
+      try {
+        const j = JSON.parse(out || "{}");
+        const info = Array.isArray(j.entries) ? j.entries[0] : j;
+        const title = capFirst(info?.title || input);
+        const uploader = info?.uploader || info?.channel || "YouTube";
+        const durationSec = Number(info?.duration) || null;
+        resolve({ title, uploader, durationSec });
+      } catch {
+        resolve({ title: capFirst(input), uploader: "YouTube", durationSec: null });
+      }
+    });
+  });
 }
 
-function streamingPipeline(urlOrQuery){
-  const inputArg = isUrl(urlOrQuery) ? urlOrQuery : ('ytsearch1:'+urlOrQuery)
-  const feeder = spawn('yt-dlp', ['-f','ba[acodec=opus]/ba/bestaudio/best','--no-playlist','-o','-','--', inputArg], { stdio: ['ignore','pipe','pipe'] })
-  feeder.stderr.on('data', d => console.error('[yt-dlp]', d.toString()))
-  const ffmpeg = spawn('ffmpeg', ['-loglevel','error','-hide_banner','-i','pipe:0','-vn','-ac','2','-c:a','libopus','-b:a','128k','-f','ogg','pipe:1'], { stdio: ['pipe','pipe','pipe'] })
-  feeder.stdout.pipe(ffmpeg.stdin).on('error',()=>{})
-  ffmpeg.stderr.on('data', d => console.error('[ffmpeg]', d.toString()))
-  return { feeder, proc: ffmpeg, stream: ffmpeg.stdout }
-}
+// 🎨 Pannello Embed
+function panelEmbed(guildId, status, data) {
+  const e = new EmbedBuilder().setColor(0x9b59b6);
 
-// ---- Pannello unico (stati: idle/search/playing/error) ----
-function panelEmbed(data, status='idle', extra={}){
-  const e = new EmbedBuilder().setColor(THEME.color)
-  if (status==='search'){
-    e.setDescription(`**${EMO.search} Sto preparando il brano…**\nRichiesta: \`${data.nextQuery || '—'}\``)
-  } else if (status==='playing'){
-    const requester = data.requesterId ? `<@${data.requesterId}>` : (data.requesterTag?`[${data.requesterTag}]`:'')
-    const pos = data.resource ? Math.floor((data.resource.playbackDuration || 0)/1000) : 0
-    const dur = data.durationSec ?? 0
-    const bar = progressBar(pos, dur, 20)
-    const rem = Math.max(0, (dur||0) - pos)
+  if (status === "idle") {
+    e.setTitle("Now Playing — nessuna traccia");
+    e.setDescription(`Usa \`${PREFIX}play <link|titolo>\``);
+  } else if (status === "search") {
+    e.setTitle("Sto cercando il brano...");
+  } else if (status === "playing") {
+    const requester = data.requesterTag || "—";
+    const pos = data.resource ? Math.floor((data.resource.playbackDuration || 0) / 1000) : 0;
+    const dur = data.durationSec ?? 0;
+    const bar = dur > 0 ? progressBar(pos, dur, 20) : "🔘" + "─".repeat(19);
+    const rem = dur > 0 ? Math.max(0, dur - pos) : null;
+
+    e.setTitle("In riproduzione 🎶");
     e.setDescription([
-      `**Now Playing** \`${data.nowTitle||'—'}\`  by ${requester||'—'}`,
-      dur ? `\`${bar}\`` : '',
-      dur ? `${EMO.timer} **${fmtDur(pos)}** trascorsi • **-${fmtDur(rem)}** rimanenti  *(totale ${fmtDur(dur)})*` : ''
-    ].filter(Boolean).join('\n'))
-  } else if (status==='error'){
-    const msg = extra.message || data.lastError || 'Si è verificato un errore.'
-    e.setDescription(`${EMO.err} **Errore**: ${'`'+msg+'`'}`)
+      `**${data.nowTitle || "—"}**  _(by ${requester})_`,
+      `\`${bar}\``,
+      rem != null
+        ? `⏱️ ${fmtDur(pos)} trascorsi • -${fmtDur(rem)} rimanenti (totale ${fmtDur(dur)})`
+        : `⏱️ ${fmtDur(pos)} trascorsi • durata sconosciuta`
+    ].join("\n"));
+  }
+
+  return e;
+}
+
+// Bottoni controlli
+function controlsRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("prev").setEmoji("⏮️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("pause").setEmoji("⏸️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("resume").setEmoji("▶️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("stop").setEmoji("⏹️").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("skip").setEmoji("⏭️").setStyle(ButtonStyle.Secondary)
+  );
+}
+
+// 📌 Aggiorna/crea pannello
+async function upsertPanel(guildId, status) {
+  const data = queue.get(guildId);
+  const ch = await client.channels.fetch(data.textChannel);
+  if (!ch) return;
+
+  if (!data.panelMsg) {
+    data.panelMsg = await ch.send({
+      embeds: [panelEmbed(guildId, status, data)],
+      components: [controlsRow()]
+    });
   } else {
-    e.setDescription('**Now Playing** — nessuna traccia\nUsa `!play <link|titolo>`')
+    await data.panelMsg.edit({
+      embeds: [panelEmbed(guildId, status, data)],
+      components: [controlsRow()]
+    });
   }
-  return e
 }
-function panelButtons(status='idle'){
-  const playing = status==='playing'
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ctrl_prev').setEmoji(EMO.prev).setStyle(ButtonStyle.Secondary).setDisabled(true),
-    new ButtonBuilder().setCustomId(playing?'ctrl_pause':'ctrl_resume').setEmoji(playing?EMO.pause:EMO.play).setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('ctrl_skip').setEmoji(EMO.skip).setStyle(ButtonStyle.Secondary).setDisabled(!playing),
-    new ButtonBuilder().setCustomId('ctrl_stop').setEmoji(EMO.stop).setStyle(ButtonStyle.Danger).setDisabled(!playing),
-    new ButtonBuilder().setCustomId('ctrl_queue').setEmoji(EMO.list).setStyle(ButtonStyle.Secondary)
-  )
-  return [row1]
+
+// ▶️ Play next
+async function playNext(guildId) {
+  const data = queue.get(guildId);
+  if (!data || data.songs.length === 0) {
+    data.nowTitle = null;
+    await upsertPanel(guildId, "idle");
+    return;
+  }
+
+  const song = data.songs.shift();
+  data.nowTitle = song.title;
+  data.durationSec = song.durationSec;
+
+  await upsertPanel(guildId, "search");
+
+  const ytdlp = spawn("yt-dlp", [
+    "-f", "bestaudio",
+    "-o", "-", "--no-playlist", "--", song.url
+  ]);
+
+  const resource = createAudioResource(ytdlp.stdout, { inlineVolume: true });
+  data.resource = resource;
+  data.player.play(resource);
+
+  data.player.once(AudioPlayerStatus.Playing, async () => {
+    await upsertPanel(guildId, "playing");
+    clearInterval(data.progressTimer);
+    data.progressTimer = setInterval(() => {
+      if (data.player.state.status === AudioPlayerStatus.Playing) {
+        upsertPanel(guildId, "playing");
+      }
+    }, PROGRESS_INTERVAL_MS);
+  });
+
+  data.player.once(AudioPlayerStatus.Idle, () => {
+    clearInterval(data.progressTimer);
+    playNext(guildId);
+  });
 }
-async function upsertPanel(guildId, status='idle', extra={}){
-  const data = queues.get(guildId); if (!data || !data.textChannel) return
-  data.lastStatus = status
-  const embed = panelEmbed(data, status, extra); const comps = panelButtons(status)
-  try{
-    // 1) aggiorna pannello già noto
-    if (data.controlsMsgId){
-      const m = await data.textChannel.messages.fetch(data.controlsMsgId).catch(()=>null)
-      if (m) { await m.edit({ embeds:[embed], components: comps }); return }
+
+// 🎧 Comandi testuali
+client.on("messageCreate", async (msg) => {
+  if (!msg.content.startsWith(PREFIX) || msg.author.bot) return;
+  const args = msg.content.slice(PREFIX.length).trim().split(/ +/);
+  const cmd = args.shift().toLowerCase();
+  const guildId = msg.guild.id;
+
+  if (cmd === "play") {
+    const query = args.join(" ");
+    if (!query) return msg.reply("Inserisci un titolo o link!");
+
+    const vc = msg.member?.voice?.channel;
+    if (!vc) return msg.reply("Devi essere in un canale vocale!");
+
+    let data = queue.get(guildId);
+    if (!data) {
+      const conn = joinVoiceChannel({
+        channelId: vc.id,
+        guildId,
+        adapterCreator: msg.guild.voiceAdapterCreator
+      });
+      const player = createAudioPlayer();
+      conn.subscribe(player);
+      data = { textChannel: msg.channel.id, voiceChannel: vc.id, conn, player, songs: [] };
+      queue.set(guildId, data);
     }
-    // 2) riusa un messaggio precedente del bot (anti-duplicato)
-    const recent = await data.textChannel.messages.fetch({ limit: 30 }).catch(()=>null)
-    if (recent) {
-      const mine = recent.find(msg => msg.author?.id === msg.client?.user?.id)
-      if (mine) { data.controlsMsgId = mine.id; await mine.edit({ embeds:[embed], components: comps }); return }
-    }
-    // 3) crea pannello nuovo
-    const sent = await data.textChannel.send({ embeds:[embed], components: comps })
-    data.controlsMsgId = sent.id
-  }catch(e){ console.error('[panel]', e) }
-}
 
-// ---------- Core playback ----------
-async function playNext(guildId){
-  const data = queues.get(guildId); if (!data) return
-  if (data.playing) return
-  const next = data.queue.shift(); if (!next){ upsertPanel(guildId,'idle'); return }
-  data.playing = true
-  data.nextQuery = next.query
-  await upsertPanel(guildId, 'search')
+    const meta = await resolveMeta(query);
+    data.songs.push({ title: meta.title, url: query, durationSec: meta.durationSec });
+    msg.reply(`🎶 Aggiunto in coda: **${meta.title}**`);
 
-  try {
-    const meta = await resolveMeta(next.query)
-    data.nowTitle = meta.title
-    data.uploader = meta.uploader
-    data.durationSec = meta.durationSec
-    data.requesterId = next.requesterId || null
-    data.requesterTag = next.requesterTag || null
-
-    const { feeder, proc, stream } = streamingPipeline(next.query)
-    data.current = { feeder, proc }
-
-    const conn = getVoiceConnection(guildId) || joinVoiceChannel({ channelId: next.channelId, guildId: next.guildId, adapterCreator: data.textChannel.guild.voiceAdapterCreator, selfDeaf: true })
-    if (conn) conn.subscribe(data.player)
-
-    const resource = createAudioResource(stream, { inputType: StreamType.OggOpus, inlineVolume: true })
-    data.resource = resource
-
-    data.player.once(AudioPlayerStatus.Playing, async () => {
-      await upsertPanel(guildId,'playing')
-      // avvia refresh progress
-      clearInterval(data.progressTimer)
-      data.progressTimer = setInterval(() => {
-        if (data.player.state.status === AudioPlayerStatus.Playing) upsertPanel(guildId,'playing')
-      }, PROGRESS_INTERVAL_MS)
-    })
-    data.player.play(resource)
-
-    // fail-safe: se non passa a Playing rapidamente, rimani in "search"
-    setTimeout(()=> {
-      if (data.player.state.status !== AudioPlayerStatus.Playing) upsertPanel(guildId,'search')
-    }, 1200)
-
-  } catch (e) {
-    console.error('[playNext]', e)
-    data.lastError = e?.message || 'Ricerca/stream falliti'
-    await upsertPanel(guildId, 'error', { message: data.lastError })
-    data.playing = false
-    if (data.queue.length) playNext(guildId).catch(()=>{})
+    if (data.player.state.status !== AudioPlayerStatus.Playing) playNext(guildId);
+    else upsertPanel(guildId, "playing");
   }
-}
+});
 
-const client = new Client({ intents: [
-  GatewayIntentBits.Guilds,
-  GatewayIntentBits.GuildVoiceStates,
-  GatewayIntentBits.GuildMessages,
-  GatewayIntentBits.MessageContent
-]})
+// 🔘 Pulsanti
+client.on("interactionCreate", async (i) => {
+  if (!i.isButton()) return;
+  const data = queue.get(i.guild.id);
+  if (!data) return;
 
-client.once('clientReady', () => {
-  console.log(`🤖 Online come ${client.user.tag}`)
-  client.user.setPresence({ activities: [{ name: `instance ${process.pid}`, type: 0 }], status: 'online' })
-})
-
-client.on('interactionCreate', async (i) => {
-  try{
-    if (!i.isButton()) return
-    const data = queues.get(i.guildId)
-    if (!data) return void i.reply({ content:'Nessuna sessione attiva.', ephemeral: true })
-
-    if (i.customId==='ctrl_pause'){ data.player.pause(); await i.deferUpdate(); clearInterval(data.progressTimer); data.progressTimer=null; return upsertPanel(i.guildId, 'idle') }
-    if (i.customId==='ctrl_resume'){ data.player.unpause(); await i.deferUpdate(); return upsertPanel(i.guildId, 'playing') }
-    if (i.customId==='ctrl_skip'){ data.player.stop(true); cleanup(data); await i.deferUpdate(); clearInterval(data.progressTimer); data.progressTimer=null; if (data.queue.length) playNext(i.guildId).catch(()=>{}); return upsertPanel(i.guildId, 'idle') }
-    if (i.customId==='ctrl_stop'){ data.queue.length=0; data.player.stop(true); cleanup(data); data.playing=false; await i.deferUpdate(); clearInterval(data.progressTimer); data.progressTimer=null; return upsertPanel(i.guildId, 'idle') }
-    if (i.customId==='ctrl_queue'){
-      const list = data.queue.slice(0, 15).map((q,idx)=> `${idx+1}. ${q.query}`).join('\n') || '—'
-      return void i.reply({ content: `Prossimi brani:\n${list}`, ephemeral: true })
-    }
-  }catch(e){
-    console.error('[interaction]', e)
-    if (i.isRepliable() && !i.replied && !i.deferred) await i.reply({ content:'Errore interazione.', ephemeral:true })
+  switch (i.customId) {
+    case "pause": data.player.pause(); break;
+    case "resume": data.player.unpause(); break;
+    case "skip": data.player.stop(); break;
+    case "stop": data.songs = []; data.player.stop(); break;
   }
-})
+  await i.deferUpdate();
+});
 
-client.on('messageCreate', async (m) => {
-  if (m.author.bot) return
-  if (!m.content.startsWith(PREFIX)) return
-
-  const args = m.content.slice(PREFIX.length).trim().split(/\s+/)
-  const cmd = (args.shift()||'').toLowerCase()
-  const data = ensureGuild(m.guildId, m.channel)
-  const deleteLater = async () => { if (DELETE_COMMANDS) { try { await m.delete() } catch {} } }
-
-  if (cmd === 'play'){
-    const q = args.join(' ')
-    if (!q) { await m.reply('Uso: `!play <link o titolo>`'); return deleteLater() }
-    const vc = m.member.voice?.channel
-    if (!vc) { await m.reply('Devi essere in un canale vocale 🎙️'); return deleteLater() }
-
-    const conn = getVoiceConnection(m.guildId) || joinVoiceChannel({ channelId: vc.id, guildId: vc.guild.id, adapterCreator: vc.guild.voiceAdapterCreator, selfDeaf: true })
-    conn.subscribe(data.player)
-
-    data.queue.push({ query: q, requesterId: m.author.id, requesterTag: m.author.tag, channelId: vc.id, guildId: m.guildId })
-    if (data.player.state.status === AudioPlayerStatus.Idle && !data.playing) playNext(m.guildId).catch(()=>{})
-    await upsertPanel(m.guildId, 'search', {})
-    return deleteLater()
-  }
-
-  if (cmd === 'skip'){ data.player.stop(true); cleanup(data); clearInterval(data.progressTimer); data.progressTimer=null; await upsertPanel(m.guildId,'idle'); return deleteLater() }
-  if (cmd === 'stop'){ data.queue.length=0; data.player.stop(true); cleanup(data); data.playing=false; clearInterval(data.progressTimer); data.progressTimer=null; await upsertPanel(m.guildId,'idle'); return deleteLater() }
-  if (cmd === 'leave'){ getVoiceConnection(m.guildId)?.destroy(); cleanup(data); data.playing=false; clearInterval(data.progressTimer); data.progressTimer=null; await upsertPanel(m.guildId,'idle'); return deleteLater() }
-  if (cmd === 'pause'){ data.player.pause(); clearInterval(data.progressTimer); data.progressTimer=null; await upsertPanel(m.guildId,'idle'); return deleteLater() }
-  if (cmd === 'resume'){ data.player.unpause(); await upsertPanel(m.guildId,'playing'); return deleteLater() }
-  if (cmd === 'queue'){ const rest = data.queue.map((q,i)=>`${i+1}. ${q.query}`).join('\\n') || '—'; await m.reply({ content:`In coda:\\n${rest}`, allowedMentions:{parse:[]} }); return deleteLater() }
-})
-
-client.login(process.env.DISCORD_TOKEN)
+// 🚀 Avvio
+client.once("ready", () => {
+  console.log(`🤖 Online come ${client.user.tag}`);
+});
+client.login(process.env.DISCORD_TOKEN);
