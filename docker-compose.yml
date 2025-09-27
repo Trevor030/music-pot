@@ -7,3 +7,6 @@ services:
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
       PROGRESS_INTERVAL_MS: "3000"
+    working_dir: /app
+    volumes:
+      - .:/app
