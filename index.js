@@ -1,8 +1,12 @@
-// robust25.3e-stream: bot musica Discord con supporto query testuali, streaming diretto e UX messaggi
+\
+// robust25.4-stream-help: streaming pipeline + UX + menu Help interattivo
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 
-import { Client, GatewayIntentBits } from 'discord.js'
+import { 
+  Client, GatewayIntentBits,
+  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder
+} from 'discord.js'
 import {
   joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior,
   AudioPlayerStatus, getVoiceConnection, StreamType
@@ -11,47 +15,102 @@ import { spawn } from 'child_process'
 
 const PREFIX = '!'
 const queues = new Map()
+const SHOW_HELP_ON_START = (process.env.SHOW_HELP_ON_START || 'false').toLowerCase() === 'true'
 
-function ensureGuild(guildId, channel) {
-  if (!queues.has(guildId)) {
+// ---- HELP UI (embed + menu + bottoni) ----
+const HELP_SECTIONS = {
+  main: new EmbedBuilder()
+    .setTitle('📖 Menu Comandi')
+    .setDescription('Seleziona una categoria dal menu qui sotto per vedere i comandi.\nPrefisso: `!`')
+    .addFields(
+      { name: '🎵 Musica', value: '`play`, `pause`, `resume`' },
+      { name: '🧭 Coda', value: '`queue`, `skip`, `stop`' },
+      { name: '⚙️ Varie', value: '`leave`, `help`' }
+    ),
+  music: new EmbedBuilder()
+    .setTitle('🎵 Comandi Musica')
+    .setDescription([
+      '`!play <link|titolo>` — cerca/streamma e riproduce subito',
+      '`!pause` — mette in pausa',
+      '`!resume` — riprende la riproduzione'
+    ].join('\n')),
+  queue: new EmbedBuilder()
+    .setTitle('🧭 Comandi Coda')
+    .setDescription([
+      '`!queue` — mostra la coda',
+      '`!skip` — salta il brano corrente',
+      '`!stop` — ferma tutto e svuota la coda'
+    ].join('\n')),
+  misc: new EmbedBuilder()
+    .setTitle('⚙️ Altri Comandi')
+    .setDescription([
+      '`!leave` — il bot esce dal canale vocale',
+      '`!help` — apre questo menu'
+    ].join('\n')),
+}
+
+function helpComponents(active = 'main') {
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('help_select')
+    .setPlaceholder('Scegli una categoria…')
+    .addOptions(
+      { label: 'Panoramica', value: 'main', emoji: '📖', default: active==='main' },
+      { label: 'Musica', value: 'music', emoji: '🎵', default: active==='music' },
+      { label: 'Coda', value: 'queue', emoji: '🧭', default: active==='queue' },
+      { label: 'Varie', value: 'misc',  emoji: '⚙️', default: active==='misc'  },
+    )
+
+  const row1 = new ActionRowBuilder().addComponents(select)
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('help_prev').setLabel('◀️ Indice').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('help_music').setLabel('Musica').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('help_queue').setLabel('Coda').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('help_misc').setLabel('Varie').setStyle(ButtonStyle.Primary),
+  )
+  return [row1, row2]
+}
+
+// ---------- Helpers ----------
+function ensureGuild(guildId, channel){
+  if(!queues.has(guildId)){
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } })
     const data = { queue: [], player, textChannel: channel, current: null, playing: false }
     player.on(AudioPlayerStatus.Idle, () => {
       data.playing = false
       cleanup(data)
-      if (data.queue.length) playNext(channel.guild.id).catch(() => {})
+      if (data.queue.length) playNext(channel.guild.id).catch(()=>{})
     })
     player.on('error', e => {
       console.error('[player]', e); data.playing = false; cleanup(data)
-      if (data.queue.length) playNext(channel.guild.id).catch(() => {})
+      if (data.queue.length) playNext(channel.guild.id).catch(()=>{})
     })
     queues.set(guildId, data)
   }
   return queues.get(guildId)
 }
 
-function cleanup(data) {
+function cleanup(data){
   try { data.current?.feeder?.kill('SIGKILL') } catch {}
   try { data.current?.proc?.kill('SIGKILL') } catch {}
   data.current = null
 }
 
-function isUrl(s) { try { new URL(s); return true } catch { return false } }
+function isUrl(s){ try{ new URL(s); return true } catch { return false } }
 
 // Titolo veloce (senza URL) per UX
-function quickTitle(input) {
+function quickTitle(input){
   return new Promise((resolve) => {
     const args = ['--no-playlist','--no-progress','-f','ba[acodec=opus]/ba/bestaudio','--get-title']
-    if (isUrl(input)) args.push(input); else args.unshift('ytsearch1:' + input)
+    if (isUrl(input)) args.push(input); else args.unshift('ytsearch1:'+input)
     const p = spawn('yt-dlp', args, { stdio: ['ignore','pipe','pipe'] })
-    let out = ''; p.stdout.on('data', d => out += d.toString())
+    let out=''; p.stdout.on('data',d=>out+=d.toString())
     p.on('close', () => resolve(out.trim().split('\n')[0] || input))
   })
 }
 
 // Streaming pipeline: yt-dlp -> stdout -> ffmpeg -> opus/ogg
-function streamingPipeline(urlOrQuery) {
-  const inputArg = isUrl(urlOrQuery) ? urlOrQuery : ('ytsearch1:' + urlOrQuery)
+function streamingPipeline(urlOrQuery){
+  const inputArg = isUrl(urlOrQuery) ? urlOrQuery : ('ytsearch1:'+urlOrQuery)
   const ytdlpArgs = [
     '-f','ba[acodec=opus]/ba/bestaudio/best',
     '--no-playlist','-o','-',
@@ -67,22 +126,24 @@ function streamingPipeline(urlOrQuery) {
     '-f','ogg','pipe:1'
   ], { stdio: ['pipe','pipe','pipe'] })
 
-  feeder.stdout.pipe(ffmpeg.stdin).on('error', () => {})
+  feeder.stdout.pipe(ffmpeg.stdin).on('error',()=>{})
   ffmpeg.stderr.on('data', d => console.error('[ffmpeg]', d.toString()))
   return { feeder, proc: ffmpeg, stream: ffmpeg.stdout }
 }
 
-async function playNext(guildId) {
+// ---------- Core playback ----------
+async function playNext(guildId){
   const data = queues.get(guildId); if (!data) return
   if (data.playing) return
-  const next = data.queue.shift(); if (!next) { data.textChannel?.send('📭 Coda finita.'); return }
+  const next = data.queue.shift(); if (!next){ data.textChannel?.send('📭 Coda finita.'); return }
   data.playing = true
 
+  // placeholder
   let msg = null
-  if (next.placeholderId) {
+  if (next.placeholderId){
     try { msg = await data.textChannel.messages.fetch(next.placeholderId) } catch { msg = null }
   }
-  if (!msg) { try { msg = await data.textChannel.send(`⏳ Sto cercando: **${next.query}**`) } catch {} }
+  if (!msg) { try { msg = await data.textChannel.send(`⏳ Sto cercando: **${next.query}**`) } catch{} }
 
   const slowTimer = setTimeout(() => {
     if (msg) { try { msg.edit(`🔎 Ancora un attimo… cerco la versione migliore di **${next.query}**`) } catch {} }
@@ -106,7 +167,7 @@ async function playNext(guildId) {
     console.error('[playNext]', e)
     if (msg) { try { await msg.edit(`⚠️ ${e.message}`) } catch {} }
     data.playing = false
-    if (data.queue.length) playNext(guildId).catch(() => {})
+    if (data.queue.length) playNext(guildId).catch(()=>{})
   }
 }
 
@@ -117,17 +178,53 @@ const client = new Client({ intents: [
   GatewayIntentBits.MessageContent
 ]})
 
-client.once('clientReady', () => console.log(`🤖 Online come ${client.user.tag}`))
+client.once('clientReady', async () => {
+  console.log(`🤖 Online come ${client.user.tag}`)
+  if (!SHOW_HELP_ON_START) return
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const ch = (await guild.channels.fetch())
+        .filter(c => c?.isTextBased?.())
+        .first()
+      if (ch) await ch.send({ embeds: [HELP_SECTIONS.main], components: helpComponents('main') })
+    } catch {}
+  }
+})
+
+client.on('interactionCreate', async (i) => {
+  try {
+    if (i.isStringSelectMenu() && i.customId === 'help_select') {
+      const value = i.values?.[0] || 'main'
+      const embed = HELP_SECTIONS[value] || HELP_SECTIONS.main
+      return void i.update({ embeds: [embed], components: helpComponents(value) })
+    }
+    if (i.isButton()) {
+      if (i.customId === 'help_prev')  return void i.update({ embeds: [HELP_SECTIONS.main],  components: helpComponents('main') })
+      if (i.customId === 'help_music') return void i.update({ embeds: [HELP_SECTIONS.music], components: helpComponents('music') })
+      if (i.customId === 'help_queue') return void i.update({ embeds: [HELP_SECTIONS.queue], components: helpComponents('queue') })
+      if (i.customId === 'help_misc')  return void i.update({ embeds: [HELP_SECTIONS.misc],  components: helpComponents('misc') })
+    }
+  } catch (err) {
+    console.error('[help interaction]', err)
+    if (i.isRepliable() && !i.replied && !i.deferred) {
+      await i.reply({ content: '❌ Qualcosa è andato storto.', ephemeral: true })
+    }
+  }
+})
 
 client.on('messageCreate', async (m) => {
   if (m.author.bot) return
   if (!m.content.startsWith(PREFIX)) return
 
   const args = m.content.slice(PREFIX.length).trim().split(/\s+/)
-  const cmd = (args.shift() || '').toLowerCase()
+  const cmd = (args.shift()||'').toLowerCase()
   const data = ensureGuild(m.guildId, m.channel)
 
-  if (cmd === 'play') {
+  if (cmd === 'help') {
+    return void m.reply({ embeds: [HELP_SECTIONS.main], components: helpComponents('main') })
+  }
+
+  if (cmd === 'play'){
     const q = args.join(' ')
     if (!q) return void m.reply('Uso: `!play <link o titolo>`')
     const vc = m.member.voice?.channel
@@ -140,19 +237,16 @@ client.on('messageCreate', async (m) => {
 
     const placeholder = await m.reply(`⏳ Sto cercando: **${q}**`)
     data.queue.push({ query: q, placeholderId: placeholder.id })
-    if (data.player.state.status === AudioPlayerStatus.Idle && !data.playing) playNext(m.guildId).catch(() => {})
+    if (data.player.state.status === AudioPlayerStatus.Idle && !data.playing) playNext(m.guildId).catch(()=>{})
     return
   }
 
-  if (cmd === 'skip') { data.player.stop(true); cleanup(data); return void m.reply('⏭️ Skip.') }
-  if (cmd === 'stop') { data.queue.length = 0; data.player.stop(true); cleanup(data); data.playing = false; return void m.reply('🛑 Fermato.') }
-  if (cmd === 'leave') { getVoiceConnection(m.guildId)?.destroy(); cleanup(data); data.playing = false; return void m.reply('👋 Uscito.') }
-  if (cmd === 'pause') { data.player.pause(); return void m.reply('⏸️ Pausa.') }
-  if (cmd === 'resume') { data.player.unpause(); return void m.reply('▶️ Ripresa.') }
-  if (cmd === 'queue') {
-    const rest = data.queue.map((q,i)=>`${i+1}. ${q.query}`).join('\n') || '—'
-    return void m.reply(`In coda:\n${rest}`)
-  }
+  if (cmd === 'skip'){ data.player.stop(true); cleanup(data); return void m.reply('⏭️ Skip.') }
+  if (cmd === 'stop'){ data.queue.length = 0; data.player.stop(true); cleanup(data); data.playing = false; return void m.reply('🛑 Fermato.') }
+  if (cmd === 'leave'){ getVoiceConnection(m.guildId)?.destroy(); cleanup(data); data.playing = false; return void m.reply('👋 Uscito.') }
+  if (cmd === 'pause'){ data.player.pause(); return void m.reply('⏸️ Pausa.') }
+  if (cmd === 'resume'){ data.player.unpause(); return void m.reply('▶️ Ripresa.') }
+  if (cmd === 'queue'){ const rest = data.queue.map((q,i)=>`${i+1}. ${q.query}`).join('\n') || '—'; return void m.reply(`In coda:\n${rest}`) }
 })
 
 client.login(process.env.DISCORD_TOKEN)

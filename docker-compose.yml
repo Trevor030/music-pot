@@ -4,8 +4,8 @@ services:
   discord-music-bot:
     build:
       context: .
-      dockerfile: Dockerfile
     container_name: discord-music-bot
     restart: unless-stopped
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
+      SHOW_HELP_ON_START: ${SHOW_HELP_ON_START:-false}
