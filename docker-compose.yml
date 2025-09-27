@@ -1,5 +1,4 @@
 version: "3.9"
-
 services:
   discord-music-bot:
     build: .
@@ -7,6 +6,4 @@ services:
     restart: unless-stopped
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
-    volumes:
-      - .:/app
-    working_dir: /app
+      PROGRESS_INTERVAL_MS: "3000"
