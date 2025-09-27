@@ -1,4 +1,5 @@
-// robust25.2b-minimal-ux: no stray backslash; simple + compatible + placeholder/edit
+\
+// robust25.3-stream: streaming immediato (yt-dlp stdout -> ffmpeg), UX con placeholder/edit, pipeline semplice e compatibile
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 
@@ -38,31 +39,34 @@ function cleanup(data){
 
 function isUrl(s){ try{ new URL(s); return true } catch { return false } }
 
-function resolveWithYtDlp(input){
-  return new Promise((resolve, reject) => {
-    const args = ['--no-playlist','--no-progress','-f','bestaudio','--get-title','--get-url']
+// Titolo veloce (senza URL) per evitare SABR failure su resolve
+function quickTitle(input){
+  return new Promise((resolve) => {
+    const args = ['--no-playlist','--no-progress','-f','ba[acodec=opus]/ba/bestaudio','--get-title']
     if (isUrl(input)) args.push(input); else args.unshift('ytsearch1:'+input)
     const p = spawn('yt-dlp', args, { stdio: ['ignore','pipe','pipe'] })
     let out=''; p.stdout.on('data',d=>out+=d.toString())
-    p.stderr.on('data',d=>console.error('[yt-dlp resolve]', d.toString()))
-    p.on('close', code => {
-      if (code !== 0) return reject(new Error('yt-dlp resolve failed'))
-      const [title, url] = out.trim().split('\n')
-      if (!title || !url) return reject(new Error('Nessun risultato valido'))
-      resolve({ title, url })
-    })
+    p.on('close', () => resolve(out.trim().split('\n')[0] || input))
   })
 }
 
-function pipeline(url){
-  const feeder = spawn('yt-dlp', ['-f','bestaudio','--no-playlist','-o','-', url], { stdio: ['ignore','pipe','pipe'] })
+// Streaming pipeline: yt-dlp -> stdout -> ffmpeg -> opus/ogg
+function streamingPipeline(urlOrQuery){
+  const ytdlpArgs = [
+    '-f','ba[acodec=opus]/ba/bestaudio',
+    '--no-playlist','-o','-',
+    '--', urlOrQuery
+  ]
+  const feeder = spawn('yt-dlp', ytdlpArgs, { stdio: ['ignore','pipe','pipe'] })
   feeder.stderr.on('data', d => console.error('[yt-dlp]', d.toString()))
+
   const ffmpeg = spawn('ffmpeg', [
     '-loglevel','error','-hide_banner',
     '-i','pipe:0','-vn','-ac','2',
     '-c:a','libopus','-b:a','128k',
     '-f','ogg','pipe:1'
   ], { stdio: ['pipe','pipe','pipe'] })
+
   feeder.stdout.pipe(ffmpeg.stdin).on('error',()=>{})
   ffmpeg.stderr.on('data', d => console.error('[ffmpeg]', d.toString()))
   return { feeder, proc: ffmpeg, stream: ffmpeg.stdout }
@@ -73,18 +77,32 @@ async function playNext(guildId){
   if (data.playing) return
   const next = data.queue.shift(); if (!next){ data.textChannel?.send('📭 Coda finita.'); return }
   data.playing = true
+
+  // placeholder
   let msg = null
-  if (next.placeholderId){ try { msg = await data.textChannel.messages.fetch(next.placeholderId) } catch { msg = null } }
+  if (next.placeholderId){
+    try { msg = await data.textChannel.messages.fetch(next.placeholderId) } catch { msg = null }
+  }
   if (!msg) { try { msg = await data.textChannel.send(`⏳ Sto cercando: **${next.query}**`) } catch{} }
-  const slowTimer = setTimeout(() => { if (msg) { try { msg.edit(`🔎 Ancora un attimo… cerco la versione migliore di **${next.query}**`) } catch {} } }, 1000)
+
+  const slowTimer = setTimeout(() => {
+    if (msg) { try { msg.edit(`🔎 Ancora un attimo… cerco la versione migliore di **${next.query}**`) } catch {} }
+  }, 1000)
+
   try {
-    const { title, url } = await resolveWithYtDlp(next.query)
-    const { feeder, proc, stream } = pipeline(url)
+    const title = await quickTitle(next.query)
+
+    const { feeder, proc, stream } = streamingPipeline(next.query)
     data.current = { feeder, proc }
+
     const conn = getVoiceConnection(guildId); if (conn) conn.subscribe(data.player)
     const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
-    data.player.once(AudioPlayerStatus.Playing, async () => { clearTimeout(slowTimer); if (msg) { try { await msg.edit(`▶️ In riproduzione: **${title}**`) } catch {} } })
+    data.player.once(AudioPlayerStatus.Playing, async () => {
+      clearTimeout(slowTimer)
+      if (msg) { try { await msg.edit(`▶️ In riproduzione: **${title}**`) } catch {} }
+    })
     data.player.play(resource)
+
   } catch (e) {
     clearTimeout(slowTimer)
     console.error('[playNext]', e)
