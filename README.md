@@ -1,11 +1,15 @@
-# discord-music-bot — 26.1 clean-chat (progress)
+# discord-music-bot — 26.1 clean-chat (progress) — FIX1
+
+**Cosa ho sistemato**
+- `yt-dlp` ora è la **versione standalone** (`yt-dlp_linux`) → **non** serve `python3` nell'immagine.
+- Aggiunto **tweetnacl** (pure JS) per la cifratura RTP di `@discordjs/voice` → niente dipendenze native.
 
 **Cosa fa**
 - Player unico + coda unica (no duplicati)
 - Elimina comandi dopo l’uso e messaggi non validi
 - Stato: 🔎 preparazione → 🎶 riproduzione → ❌ errore
 - Barra progressiva + timer trascorso/rimanente
-- Streaming `yt-dlp -> WebM/Opus` (senza ffmpeg)
+- Streaming `yt-dlp -> WebM/Opus` (senza ffmpeg, senza python)
 
 **Deploy consigliato (ZimaOS/Portainer + GHCR)**
 1. Crea un repo GitHub e carica tutti i file di questo zip.
