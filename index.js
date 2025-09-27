@@ -1,4 +1,4 @@
-// robust24.1: instant placeholder + parallel join + fast search + cache + stable queue/skip cleanup
+// robust24.2: instant placeholder + parallel join + fast search (ytsearch1) + cache + stable queue/skip cleanup
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 
