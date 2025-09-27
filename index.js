@@ -1,4 +1,5 @@
-// robust25.1-minimal: semplice + compatibile (ffmpeg senza -reconnect*)
+\
+// robust25.2-minimal-ux: semplice + compatibile + messaggi placeholder/edit
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 
@@ -73,18 +74,38 @@ async function playNext(guildId){
   if (data.playing) return
   const next = data.queue.shift(); if (!next){ data.textChannel?.send('📭 Coda finita.'); return }
   data.playing = true
+
+  // fetch or create placeholder
+  let msg = null
+  if (next.placeholderId){
+    try { msg = await data.textChannel.messages.fetch(next.placeholderId) } catch { msg = null }
+  }
+  if (!msg) { try { msg = await data.textChannel.send(`⏳ Sto cercando: **${next.query}**`) } catch{} }
+
+  // if search is slow, update the placeholder after 1s
+  const slowTimer = setTimeout(() => {
+    if (msg) { try { msg.edit(`🔎 Ancora un attimo… cerco la versione migliore di **${next.query}**`) } catch {} }
+  }, 1000)
+
   try {
     const { title, url } = await resolveWithYtDlp(next.query)
     const { feeder, proc, stream } = pipeline(url)
     data.current = { feeder, proc }
+
     // assicurati di essere iscritto alla voice connection
     const conn = getVoiceConnection(guildId); if (conn) conn.subscribe(data.player)
+
     const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
+    data.player.once(AudioPlayerStatus.Playing, async () => {
+      clearTimeout(slowTimer)
+      if (msg) { try { await msg.edit(`▶️ In riproduzione: **${title}**`) } catch {} }
+    })
     data.player.play(resource)
-    data.textChannel?.send(`▶️ In riproduzione: **${title}**`)
+
   } catch (e) {
+    clearTimeout(slowTimer)
     console.error('[playNext]', e)
-    data.textChannel?.send(`⚠️ ${e.message}`)
+    if (msg) { try { await msg.edit(`⚠️ ${e.message}`) } catch {} }
     data.playing = false
     if (data.queue.length) playNext(guildId).catch(()=>{})
   }
@@ -118,9 +139,12 @@ client.on('messageCreate', async (m) => {
     })
     conn.subscribe(data.player)
 
-    data.queue.push({ query: q })
+    // placeholder immediato
+    const placeholder = await m.reply(`⏳ Sto cercando: **${q}**`)
+
+    data.queue.push({ query: q, placeholderId: placeholder.id })
     if (data.player.state.status === AudioPlayerStatus.Idle && !data.playing) playNext(m.guildId).catch(()=>{})
-    return void m.reply(`🎶 Aggiunto: **${q}**`)
+    return
   }
 
   if (cmd === 'skip'){
