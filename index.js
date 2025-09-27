@@ -1,5 +1,5 @@
 \
-// music-pot 26.0.1-webm (no ffmpeg) – progress bar + timer + mini panel
+// music-pot GHCR bundle – WebM/Opus direct (no ffmpeg) – progress bar + timer + mini panel
 import 'dotenv/config'
 import {
   Client, GatewayIntentBits,
@@ -13,7 +13,7 @@ import { spawn } from 'child_process'
 
 const PREFIX = '!'
 const PROGRESS_INTERVAL_MS = Number(process.env.PROGRESS_INTERVAL_MS || 3000)
-const queues = new Map() // guildId -> session
+const queues = new Map()
 
 const capFirst = (s) => { s = String(s||'').trim(); return s ? s[0].toUpperCase()+s.slice(1) : s }
 const fmtDur = (sec)=>{ if(sec==null)return '—'; sec=Math.max(0,Math.floor(sec)); const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60; return h?`${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${m}:${String(s).padStart(2,'0')}` }
@@ -24,7 +24,6 @@ const progressBar = (pos=0,dur=0,w=20)=>{
 }
 const isUrl = (s)=>{ try{ new URL(s); return true }catch{ return false } }
 
-// Robust metadata via yt-dlp -J
 function resolveMeta(input){
   return new Promise((resolve) => {
     const query = isUrl(input) ? input : ('ytsearch1:'+input)
@@ -45,7 +44,6 @@ function resolveMeta(input){
   })
 }
 
-// Direct WebM/Opus stream (no ffmpeg)
 function webmOpusStream(input){
   const query = isUrl(input) ? input : ('ytsearch1:'+input)
   const proc = spawn('yt-dlp', ['-f','251/bestaudio','--no-playlist','-o','-','--', query], { stdio:['ignore','pipe','pipe'] })
@@ -53,8 +51,8 @@ function webmOpusStream(input){
   return { proc, stream: proc.stdout }
 }
 
-function ensureSession(g, channel){
-  if(!queues.has(g)){
+function ensureSession(guildId, channel){
+  if(!queues.has(guildId)){
     const player = createAudioPlayer()
     const data = {
       player, textChannel: channel, queue: [], panelId: null,
@@ -64,21 +62,21 @@ function ensureSession(g, channel){
     player.on(AudioPlayerStatus.Idle, ()=>{
       clearInterval(data.progressTimer); data.progressTimer=null
       data.resource=null; data.nowTitle=null; data.durationSec=null
-      if (data.queue.length) { playNext(g).catch(()=>{}) } else { upsertPanel(g, 'idle').catch(()=>{}) }
+      if (data.queue.length) { playNext(guildId).catch(()=>{}) } else { upsertPanel(guildId, 'idle').catch(()=>{}) }
     })
     player.on('error', e => {
       console.error('[player]', e)
       clearInterval(data.progressTimer); data.progressTimer=null
-      upsertPanel(g,'error',{message:e?.message||'Errore'}).catch(()=>{})
-      if (data.queue.length) playNext(g).catch(()=>{})
+      upsertPanel(guildId,'error',{message:e?.message||'Errore'}).catch(()=>{})
+      if (data.queue.length) playNext(guildId).catch(()=>{})
     })
-    queues.set(g, data)
+    queues.set(guildId, data)
   }
-  return queues.get(g)
+  return queues.get(guildId)
 }
 
 function panelEmbed(data, status='idle', extra={}){
-  const THEME = 0xED4245
+  const THEME = 0x5865F2
   const e = new EmbedBuilder().setColor(THEME)
   if (status==='idle'){
     e.setTitle('Now Playing — nessuna traccia')
@@ -149,7 +147,6 @@ async function playNext(guildId){
   try{
     const { proc, stream } = webmOpusStream(next.query)
     data.currentProc = proc
-    // create WebM/Opus resource
     const resource = createAudioResource(stream, { inputType: StreamType.WebmOpus })
     data.resource = resource
 
