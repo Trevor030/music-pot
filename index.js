@@ -1,4 +1,4 @@
-// 26.1-fix3.1 — single panel (mutex), fast skip feedback (no unknown interaction), locked channel
+// 26.1-fix3.2 — keep queue message while pruning, single panel mutex, fast skip feedback
 import 'dotenv/config'
 import {
   Client, GatewayIntentBits,
@@ -107,11 +107,15 @@ async function withPanelLock(data, fn) {
   data.panelUpdating = true
   try { return await fn() } finally { data.panelUpdating = false }
 }
-async function pruneOldPanels(data, keepId) {
+async function pruneOldPanels(data, keepIds = []) {
+  const keep = new Set(keepIds.filter(Boolean))
+  if (data.queueMsgId) keep.add(data.queueMsgId) // preserva SEMPRE la coda
   try {
     const recent = await data.textChannel.messages.fetch({ limit: 50 })
     const mine = [...recent.values()].filter(m => m.author?.id === m.client?.user?.id)
-    for (const m of mine) { if (m.id !== keepId) await m.delete().catch(()=>{}) }
+    for (const m of mine) {
+      if (!keep.has(m.id)) await m.delete().catch(()=>{})
+    }
   } catch {}
 }
 
@@ -159,17 +163,17 @@ async function upsertPanel(guildId, status='idle', extra={}){
 
     if (data.controlsMsgId) {
       const m = await data.textChannel.messages.fetch(data.controlsMsgId).catch(()=>null)
-      if (m) { await m.edit({ embeds:[embed], components: comps }); await pruneOldPanels(data, m.id); return }
+      if (m) { await m.edit({ embeds:[embed], components: comps }); await pruneOldPanels(data, [m.id]); return }
       data.controlsMsgId = null
     }
     try {
       const recent = await data.textChannel.messages.fetch({ limit: 50 })
       const mine = [...recent.values()].find(msg => msg.author?.id === msg.client?.user?.id)
-      if (mine) { data.controlsMsgId = mine.id; await mine.edit({ embeds:[embed], components: comps }); await pruneOldPanels(data, mine.id); return }
+      if (mine) { data.controlsMsgId = mine.id; await mine.edit({ embeds:[embed], components: comps }); await pruneOldPanels(data, [mine.id]); return }
     } catch {}
     const sent = await data.textChannel.send({ embeds:[embed], components: comps })
     data.controlsMsgId = sent.id
-    await pruneOldPanels(data, sent.id)
+    await pruneOldPanels(data, [sent.id])
   })
 }
 
@@ -280,14 +284,11 @@ client.on('interactionCreate', async (i)=>{
       const d = queues.get(i.guildId)
       const nextItem = d?.queue?.[0]
 
-      // Rispondi SUBITO (ephemeral con flags) per evitare timeout
       if (nextItem) {
         await i.reply({ content: `⏭️ Skippato. Prossimo: **${nextItem.query}** — sto per riprodurlo…`, flags: MessageFlags.Ephemeral })
         d.nextQuery = nextItem.query
         await upsertPanel(i.guildId,'search')
-        // risolvi il titolo senza bloccare la risposta
         resolveMeta(nextItem.query).then(meta=>{
-          // prova ad aggiornare il messaggio effimero
           try { i.editReply({ content: `⏭️ Skippato. Prossimo: **${meta.title}** — sto per riprodurlo…` }) } catch {}
         }).catch(()=>{})
       } else {
