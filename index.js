@@ -1,8 +1,8 @@
-// 26.1-fix2 — clean chat, single panel/queue, race-free queue/skip, locked channel, no pause/queue, disconnect button
+// 26.1-fix3 — clean chat, single panel/queue, race-free queue/skip, locked channel, skip feedback, no pause/queue, disconnect button
 import 'dotenv/config'
 import {
   Client, GatewayIntentBits,
-  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionsBitField
+  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle
 } from 'discord.js'
 import {
   joinVoiceChannel, createAudioPlayer, createAudioResource,
@@ -270,11 +270,30 @@ client.on('interactionCreate', async (i)=>{
 
   try {
     if (i.customId==='ctrl_skip'){
+      const d = queues.get(i.guildId)
+      const nextItem = d?.queue?.[0]
+
+      if (nextItem) {
+        d.nextQuery = nextItem.query
+        await upsertPanel(i.guildId,'search')
+        try {
+          const meta = await resolveMeta(nextItem.query)
+          await i.reply({ content: `⏭️ Skippato. Prossimo: **${meta.title}** — sto per riprodurlo…`, ephemeral: true })
+        } catch {
+          await i.reply({ content: `⏭️ Skippato. Prossimo: **${nextItem.query}** — sto per riprodurlo…`, ephemeral: true })
+        }
+      } else {
+        await i.reply({ content: '⏭️ Skippato. **Coda vuota**.', ephemeral: true })
+      }
+
       await safeStopAll(i.guildId)
-      await upsertPanel(i.guildId,'idle')
-      await upsertQueueMessage(i.guildId)
-      if (queues.get(i.guildId)?.queue.length) playNext(i.guildId).catch(()=>{})
-      return void i.deferUpdate()
+      if (queues.get(i.guildId)?.queue.length) {
+        playNext(i.guildId).catch(()=>{})
+      } else {
+        await upsertPanel(i.guildId,'idle')
+        await upsertQueueMessage(i.guildId)
+      }
+      return
     }
     if (i.customId==='ctrl_stop'){
       const d = queues.get(i.guildId); if (d) d.queue.length = 0
@@ -340,10 +359,22 @@ client.on('messageCreate', async (m)=>{
   }
 
   if (cmd==='skip'){
+    const d = queues.get(m.guildId)
+    const nextItem = d?.queue?.[0]
+
+    if (nextItem) {
+      d.nextQuery = nextItem.query
+      await upsertPanel(m.guildId, 'search')
+    } else {
+      await upsertPanel(m.guildId, 'idle')
+    }
+
     await safeStopAll(m.guildId)
-    await upsertPanel(m.guildId,'idle')
-    await upsertQueueMessage(m.guildId)
-    if (queues.get(m.guildId)?.queue.length) playNext(m.guildId).catch(()=>{})
+    if (queues.get(m.guildId)?.queue.length) {
+      playNext(m.guildId).catch(()=>{})
+    } else {
+      await upsertQueueMessage(m.guildId)
+    }
     return zap()
   }
 
