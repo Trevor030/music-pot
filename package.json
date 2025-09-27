@@ -1,7 +1,7 @@
 {
   "name": "music-pot",
-  "version": "26.1.3-fix3.2",
-  "description": "Discord Music Bot (keep queue message, single panel mutex, fast skip feedback, locked channel)",
+  "version": "26.1.3-fix3.3",
+  "description": "Discord Music Bot (yt-dlp android client + 251/250/249, single panel, keep queue, fast skip feedback, locked channel)",
   "main": "index.js",
   "type": "module",
   "scripts": {

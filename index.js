@@ -1,4 +1,4 @@
-// 26.1-fix3.2 — keep queue message while pruning, single panel mutex, fast skip feedback
+// 26.1-fix3.3 — yt-dlp Android client + itags 251/250/249, single panel mutex, keep queue, fast skip feedback
 import 'dotenv/config'
 import {
   Client, GatewayIntentBits,
@@ -77,7 +77,11 @@ async function safeStopAll(guildId){ const d=queues.get(guildId); if(!d) return;
 function resolveMeta(input){
   return new Promise((resolve) => {
     const query = isUrl(input) ? input : ('ytsearch1:'+input)
-    const p = spawn('yt-dlp', ['-J','--no-playlist','--', query], { stdio: ['ignore','pipe','pipe'] })
+    const p = spawn('yt-dlp', [
+      '-J', '--no-playlist',
+      '--extractor-args','youtube:player_client=android',
+      '--', query
+    ], { stdio: ['ignore','pipe','pipe'] })
     let out=''; p.stdout.on('data', d => out += d.toString())
     p.on('close', ()=>{
       try{
@@ -96,7 +100,13 @@ function resolveMeta(input){
 
 function streamWebmOpus(input){
   const query = isUrl(input) ? input : ('ytsearch1:'+input)
-  const proc = spawn('yt-dlp', ['-f','251/bestaudio','--no-playlist','-o','-','--', query], { stdio:['ignore','pipe','pipe'] })
+  const args = [
+    '-f','251/250/249',                 // priorità Opus: 251>250>249
+    '--no-playlist',
+    '--extractor-args','youtube:player_client=android',
+    '-o','-','--', query
+  ]
+  const proc = spawn('yt-dlp', args, { stdio:['ignore','pipe','pipe'] })
   proc.stderr.on('data', d => console.error('[yt-dlp]', d.toString().trim()))
   return { proc, stream: proc.stdout }
 }
