@@ -8,6 +8,5 @@ services:
     restart: unless-stopped
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
-      SHOW_HELP_ON_START: ${SHOW_HELP_ON_START:-false}
-      THEME_COLOR: ${THEME_COLOR:-0x5865F2}
-      THEME_ACCENT: ${THEME_ACCENT:-0x43B581}
+      THEME_COLOR: ${THEME_COLOR:-0xED4245}
+      DELETE_COMMANDS: ${DELETE_COMMANDS:-true}
