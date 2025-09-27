@@ -1,9 +1,10 @@
 version: "3.9"
 services:
   music-pot:
-    image: ghcr.io/<TUO_UTENTE>/<TUO_REPO>:latest   # <-- sostituisci
+    image: ghcr.io/<TUO_UTENTE>/<TUO_REPO>:latest  # <-- sostituisci con la tua immagine
     container_name: music-pot
     restart: unless-stopped
     environment:
       DISCORD_TOKEN: "${DISCORD_TOKEN}"
       PROGRESS_INTERVAL_MS: "3000"
+    # niente volumes, niente build
