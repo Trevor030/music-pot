@@ -1,4 +1,4 @@
-// robust24.3: reliable path (yt-dlp -> ffmpeg -> Ogg/Opus), fast search (ytsearch1), cache, placeholder, stable queue/skip cleanup
+// robust24.5: fixed ffmpeg flags (Debian), ensured voice subscribe, fast search + cache, placeholder, reliable queue/skip
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 
@@ -98,10 +98,13 @@ function transcodePipeline(urlOrQuery){
   feeder.stdout.on('error', () => {})
 
   const ffmpeg = spawn('ffmpeg', [
-    '-reconnect','1','-reconnect_streamed','1','-reconnect_on_network_error','1',
+    '-reconnect','1',
+    '-reconnect_streamed','1',
+    '-reconnect_delay_max','2',
     '-loglevel','error','-hide_banner',
     '-i','pipe:0','-vn','-ac','2',
-    '-c:a','libopus','-b:a','128k','-f','ogg','pipe:1'
+    '-c:a','libopus','-b:a','128k',
+    '-f','ogg','pipe:1'
   ], { stdio: ['pipe','pipe','pipe'] })
 
   feeder.stdout.pipe(ffmpeg.stdin).on('error', () => {})
@@ -135,22 +138,27 @@ async function playNext(guildId){
     const { url, title } = await resolveYouTube(next.query)
 
     const { proc, feeder, stream } = transcodePipeline(url)
-    data.currentProc = { main: proc, feeder }
+    queues.get(guildId).currentProc = { main: proc, feeder }
+
+    // SAFETY: ensure we are subscribed before playing
+    const conn = getVoiceConnection(guildId)
+    if (conn) conn.subscribe(queues.get(guildId).player)
+
     const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
-    data.player.once(AudioPlayerStatus.Playing, async () => {
+    queues.get(guildId).player.once(AudioPlayerStatus.Playing, async () => {
       clearTimeout(slowTimer)
       await msg.edit({ content: null, embeds: [
         new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
       ]})
     })
-    data.player.play(resource)
+    queues.get(guildId).player.play(resource)
 
   } catch (err) {
     clearTimeout(slowTimer)
     console.error('playNext error:', err)
     await msg.edit(`⚠️ Errore: ${err.message}`)
-    data.playing = false
-    if (data.queue.length > 0) playNext(guildId).catch(()=>{})
+    queues.get(guildId).playing = false
+    if (queues.get(guildId).queue.length > 0) playNext(guildId).catch(()=>{})
   }
 }
 
@@ -185,12 +193,9 @@ client.on('messageCreate', async (message) => {
     message.channel.sendTyping()
     const placeholder = await message.reply(`⏳ Preparo: **${query}**`)
 
-    // join in parallel
-    const joinP = (async () => {
-      const existing = getVoiceConnection(guildId)
-      if (existing) return existing
-      return joinVoiceChannel({ channelId: vc.id, guildId: vc.guild.id, adapterCreator: vc.guild.voiceAdapterCreator, selfDeaf: true })
-    })()
+    // join (or get existing) and subscribe immediately
+    const conn = getVoiceConnection(guildId) || joinVoiceChannel({ channelId: vc.id, guildId: vc.guild.id, adapterCreator: vc.guild.voiceAdapterCreator, selfDeaf: true })
+    conn.subscribe(data.player)
 
     // enqueue and kick playback if idle
     data.queue.push({ query, requestedBy: message.author.tag, placeholderId: placeholder.id })
