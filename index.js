@@ -1,8 +1,8 @@
-// robust24.5: fixed ffmpeg flags (Debian), ensured voice subscribe, fast search + cache, placeholder, reliable queue/skip
+// robust25.1-minimal: semplice + compatibile (ffmpeg senza -reconnect*)
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 
-import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js'
+import { Client, GatewayIntentBits } from 'discord.js'
 import {
   joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior,
   AudioPlayerStatus, getVoiceConnection, StreamType
@@ -11,229 +11,135 @@ import { spawn } from 'child_process'
 
 const PREFIX = '!'
 const queues = new Map()
-const searchCache = new Map() // query -> {title,url}
-
-// ---------- Helpers ----------
-function isUrl(str){ try { new URL(str); return true } catch { return false } }
-
-function killChildSafe(child){
-  if(!child) return
-  try { child.stdin?.destroy() } catch {}
-  try { child.stdout?.destroy() } catch {}
-  try { child.stderr?.destroy() } catch {}
-  try { child.kill?.('SIGKILL') } catch {}
-}
 
 function ensureGuild(guildId, channel){
   if(!queues.has(guildId)){
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } })
-    const data = { queue: [], player, textChannel: channel, currentProc: null, playing: false }
-    // Auto-next & cleanup
+    const data = { queue: [], player, textChannel: channel, current: null, playing: false }
     player.on(AudioPlayerStatus.Idle, () => {
       data.playing = false
-      if (data.currentProc){
-        killChildSafe(data.currentProc.main)
-        killChildSafe(data.currentProc.feeder)
-        data.currentProc = null
-      }
-      if (data.queue.length > 0) playNext(guildId).catch(e => console.error('playNext err:', e))
+      cleanup(data)
+      if (data.queue.length) playNext(channel.guild.id).catch(()=>{})
     })
-    player.on('error', (e) => {
-      console.error('Audio player error:', e)
-      data.playing = false
-      if (data.currentProc){
-        killChildSafe(data.currentProc.main)
-        killChildSafe(data.currentProc.feeder)
-        data.currentProc = null
-      }
-      if (data.queue.length > 0) playNext(guildId).catch(()=>{})
+    player.on('error', e => {
+      console.error('[player]', e); data.playing = false; cleanup(data)
+      if (data.queue.length) playNext(channel.guild.id).catch(()=>{})
     })
     queues.set(guildId, data)
   }
   return queues.get(guildId)
 }
 
-// ---------- Search: ytsearch1 for speed + cache ----------
-async function resolveYouTube(query){
-  if (isUrl(query)){
-    return await resolveWithYtDlp(query, false)
-  }
-  const key = query.toLowerCase()
-  if (searchCache.has(key)) return searchCache.get(key)
-  const res = await resolveWithYtDlp(query, true)
-  searchCache.set(key, res)
-  return res
+function cleanup(data){
+  try { data.current?.feeder?.kill('SIGKILL') } catch {}
+  try { data.current?.proc?.kill('SIGKILL') } catch {}
+  data.current = null
 }
 
-function resolveWithYtDlp(input, useSearch){
+function isUrl(s){ try{ new URL(s); return true } catch { return false } }
+
+function resolveWithYtDlp(input){
   return new Promise((resolve, reject) => {
-    const args = [
-      '--no-playlist', '--no-progress', '--force-ipv4',
-      '-f', 'bestaudio',
-      '--get-title', '--get-url'
-    ]
-    if (useSearch){
-      args.unshift('ytsearch1:'+input)     // fastest: only first result
-    } else {
-      args.push(input)
-    }
-    const proc = spawn('yt-dlp', args, { stdio: ['ignore','pipe','pipe'] })
-    let out = ''
-    proc.stdout.on('data', d => { out += d.toString() })
-    proc.stderr.on('data', d => console.error('[yt-dlp resolve]', d.toString()))
-    proc.on('close', code => {
+    const args = ['--no-playlist','--no-progress','-f','bestaudio','--get-title','--get-url']
+    if (isUrl(input)) args.push(input); else args.unshift('ytsearch1:'+input)
+    const p = spawn('yt-dlp', args, { stdio: ['ignore','pipe','pipe'] })
+    let out=''; p.stdout.on('data',d=>out+=d.toString())
+    p.stderr.on('data',d=>console.error('[yt-dlp resolve]', d.toString()))
+    p.on('close', code => {
       if (code !== 0) return reject(new Error('yt-dlp resolve failed'))
-      const lines = out.trim().split('\n')
-      if (lines.length < 2) return reject(new Error('Nessun risultato valido.'))
-      const title = lines[0]; const url = lines[1]
+      const [title, url] = out.trim().split('\n')
+      if (!title || !url) return reject(new Error('Nessun risultato valido'))
       resolve({ title, url })
     })
   })
 }
 
-// ---------- Playback: yt-dlp -> ffmpeg (ogg/opus) ----------
-function transcodePipeline(urlOrQuery){
-  const feeder = spawn('yt-dlp', ['-f','bestaudio','--no-playlist','-o','-', urlOrQuery], { stdio: ['ignore','pipe','pipe'] })
+function pipeline(url){
+  const feeder = spawn('yt-dlp', ['-f','bestaudio','--no-playlist','-o','-', url], { stdio: ['ignore','pipe','pipe'] })
   feeder.stderr.on('data', d => console.error('[yt-dlp]', d.toString()))
-  feeder.stdout.on('error', () => {})
-
   const ffmpeg = spawn('ffmpeg', [
-    '-reconnect','1',
-    '-reconnect_streamed','1',
-    '-reconnect_delay_max','2',
     '-loglevel','error','-hide_banner',
     '-i','pipe:0','-vn','-ac','2',
     '-c:a','libopus','-b:a','128k',
     '-f','ogg','pipe:1'
   ], { stdio: ['pipe','pipe','pipe'] })
-
-  feeder.stdout.pipe(ffmpeg.stdin).on('error', () => {})
-  ffmpeg.stdin.on('error', () => {})
-  ffmpeg.stdout.on('error', () => {})
+  feeder.stdout.pipe(ffmpeg.stdin).on('error',()=>{})
   ffmpeg.stderr.on('data', d => console.error('[ffmpeg]', d.toString()))
-  return { proc: ffmpeg, feeder, stream: ffmpeg.stdout }
+  return { feeder, proc: ffmpeg, stream: ffmpeg.stdout }
 }
 
-// ---------- Core playback ----------
 async function playNext(guildId){
   const data = queues.get(guildId); if (!data) return
   if (data.playing) return
-  const next = data.queue.shift()
-  if (!next){ data.textChannel?.send('📭 Coda finita.'); return }
+  const next = data.queue.shift(); if (!next){ data.textChannel?.send('📭 Coda finita.'); return }
   data.playing = true
-
-  // placeholder message (create or fetch)
-  let msg = null
-  if (next.placeholderId){
-    try { msg = await data.textChannel.messages.fetch(next.placeholderId) } catch { msg = null }
-  }
-  if (!msg) msg = await data.textChannel.send(`⏳ Preparo: **${next.query}**`)
-
-  // Show “searching” if resolution takes > 1s
-  const slowTimer = setTimeout(() => {
-    if (msg && !msg.embeds?.length) msg.edit(`🔎 Sto cercando la versione più veloce di **${next.query}**...`)
-  }, 1000)
-
   try {
-    const { url, title } = await resolveYouTube(next.query)
-
-    const { proc, feeder, stream } = transcodePipeline(url)
-    queues.get(guildId).currentProc = { main: proc, feeder }
-
-    // SAFETY: ensure we are subscribed before playing
-    const conn = getVoiceConnection(guildId)
-    if (conn) conn.subscribe(queues.get(guildId).player)
-
+    const { title, url } = await resolveWithYtDlp(next.query)
+    const { feeder, proc, stream } = pipeline(url)
+    data.current = { feeder, proc }
+    // assicurati di essere iscritto alla voice connection
+    const conn = getVoiceConnection(guildId); if (conn) conn.subscribe(data.player)
     const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
-    queues.get(guildId).player.once(AudioPlayerStatus.Playing, async () => {
-      clearTimeout(slowTimer)
-      await msg.edit({ content: null, embeds: [
-        new EmbedBuilder().setTitle('▶️ In riproduzione').setDescription(`[${title}](${url})`).setFooter({ text: `Richiesto da ${next.requestedBy}` })
-      ]})
-    })
-    queues.get(guildId).player.play(resource)
-
-  } catch (err) {
-    clearTimeout(slowTimer)
-    console.error('playNext error:', err)
-    await msg.edit(`⚠️ Errore: ${err.message}`)
-    queues.get(guildId).playing = false
-    if (queues.get(guildId).queue.length > 0) playNext(guildId).catch(()=>{})
+    data.player.play(resource)
+    data.textChannel?.send(`▶️ In riproduzione: **${title}**`)
+  } catch (e) {
+    console.error('[playNext]', e)
+    data.textChannel?.send(`⚠️ ${e.message}`)
+    data.playing = false
+    if (data.queue.length) playNext(guildId).catch(()=>{})
   }
 }
 
-// ---------- Discord client & commands ----------
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
-})
+const client = new Client({ intents: [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildVoiceStates,
+  GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.MessageContent
+]})
 
 client.once('clientReady', () => console.log(`🤖 Online come ${client.user.tag}`))
 
-client.on('messageCreate', async (message) => {
-  if (message.author.bot) return
-  if (!message.content.startsWith(PREFIX)) return
+client.on('messageCreate', async (m) => {
+  if (m.author.bot) return
+  if (!m.content.startsWith(PREFIX)) return
 
-  const args = message.content.slice(PREFIX.length).trim().split(/\s+/)
-  const command = (args.shift() || '').toLowerCase()
-  const guildId = message.guildId
-  const data = ensureGuild(guildId, message.channel)
+  const args = m.content.slice(PREFIX.length).trim().split(/\s+/)
+  const cmd = (args.shift()||'').toLowerCase()
+  const data = ensureGuild(m.guildId, m.channel)
 
-  if (command === 'play'){
-    const query = args.join(' ')
-    if (!query) return void message.reply('Uso: `!play <link YouTube o titolo>`')
-    const vc = message.member.voice?.channel
-    if (!vc) return void message.reply('Devi essere in un canale vocale 🎙️')
+  if (cmd === 'play'){
+    const q = args.join(' ')
+    if (!q) return void m.reply('Uso: `!play <link o titolo>`')
+    const vc = m.member.voice?.channel
+    if (!vc) return void m.reply('Devi essere in un canale vocale 🎙️')
 
-    // show typing + placeholder immediately
-    message.channel.sendTyping()
-    const placeholder = await message.reply(`⏳ Preparo: **${query}**`)
-
-    // join (or get existing) and subscribe immediately
-    const conn = getVoiceConnection(guildId) || joinVoiceChannel({ channelId: vc.id, guildId: vc.guild.id, adapterCreator: vc.guild.voiceAdapterCreator, selfDeaf: true })
+    const conn = getVoiceConnection(m.guildId) || joinVoiceChannel({
+      channelId: vc.id, guildId: vc.guild.id, adapterCreator: vc.guild.voiceAdapterCreator, selfDeaf: true
+    })
     conn.subscribe(data.player)
 
-    // enqueue and kick playback if idle
-    data.queue.push({ query, requestedBy: message.author.tag, placeholderId: placeholder.id })
-    if (data.player.state.status === AudioPlayerStatus.Idle && !data.playing) playNext(guildId).catch(()=>{})
-    return
+    data.queue.push({ query: q })
+    if (data.player.state.status === AudioPlayerStatus.Idle && !data.playing) playNext(m.guildId).catch(()=>{})
+    return void m.reply(`🎶 Aggiunto: **${q}**`)
   }
 
-  if (command === 'pause'){ data.player.pause(); return void message.reply('⏸️ Pausa.') }
-  if (command === 'resume'){ data.player.unpause(); return void message.reply('▶️ Ripresa.') }
-
-  if (command === 'skip'){
-    data.player.stop(true)
-    if (data.currentProc){ killChildSafe(data.currentProc.main); killChildSafe(data.currentProc.feeder); data.currentProc = null }
-    return void message.reply('⏭️ Skip.')
+  if (cmd === 'skip'){
+    data.player.stop(true); cleanup(data)
+    return void m.reply('⏭️ Skip.')
   }
-
-  if (command === 'stop'){
-    data.queue.length = 0
-    data.player.stop(true)
-    if (data.currentProc){ killChildSafe(data.currentProc.main); killChildSafe(data.currentProc.feeder); data.currentProc = null }
-    data.playing = false
-    return void message.reply('🛑 Fermato e coda svuotata.')
+  if (cmd === 'stop'){
+    data.queue.length = 0; data.player.stop(true); cleanup(data); data.playing = false
+    return void m.reply('🛑 Fermato.')
   }
-
-  if (command === 'leave'){
-    getVoiceConnection(guildId)?.destroy()
-    if (data.currentProc){ killChildSafe(data.currentProc.main); killChildSafe(data.currentProc.feeder); data.currentProc = null }
-    data.playing = false
-    return void message.reply('👋 Uscito dal canale.')
+  if (cmd === 'leave'){
+    getVoiceConnection(m.guildId)?.destroy(); cleanup(data); data.playing = false
+    return void m.reply('👋 Uscito.')
   }
-
-  if (command === 'queue'){
+  if (cmd === 'pause'){ data.player.pause(); return void m.reply('⏸️ Pausa.') }
+  if (cmd === 'resume'){ data.player.unpause(); return void m.reply('▶️ Ripresa.') }
+  if (cmd === 'queue'){
     const rest = data.queue.map((q,i)=>`${i+1}. ${q.query}`).join('\n') || '—'
-    if (data.playing){
-      return void message.reply(`**🎧 in riproduzione**\nIn coda:\n${rest}`)
-    } else {
-      return void message.reply(`In coda:\n${rest}`)
-    }
+    return void m.reply(`In coda:\n${rest}`)
   }
 })
 
