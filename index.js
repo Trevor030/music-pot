@@ -1,5 +1,5 @@
 \
-// robust25.5-stream-help-controls: streaming + Help interattivo + pannello controlli Now Playing
+// robust25.6-beauty: streaming + Help interattivo + controlli + tema grafico/cover/progress
 import 'dotenv/config'
 import sodium from 'libsodium-wrappers'; await sodium.ready
 
@@ -17,17 +17,36 @@ const PREFIX = '!'
 const queues = new Map()
 const SHOW_HELP_ON_START = (process.env.SHOW_HELP_ON_START || 'false').toLowerCase() === 'true'
 
+// 🎨 Tema ed utilità
+const THEME = {
+  color: Number(process.env.THEME_COLOR || 0x5865F2),
+  accent: Number(process.env.THEME_ACCENT || 0x43B581)
+}
+const EMO = {
+  play: '▶️', pause: '⏸️', resume: '▶️', stop: '🛑', skip: '⏭️',
+  queue: '🧭', leave: '👋', refresh: '🔄', help: '❓', search: '🔎', cd: '💿'
+}
+function fmtDur(sec){ if(!sec && sec!==0) return '—'; const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60; return h?`${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${m}:${String(s).padStart(2,'0')}` }
+function progressBar(pos=0, dur=0, width=18){
+  if(!dur || dur<=0) return '―'.repeat(width)
+  const p = Math.max(0, Math.min(1, pos/dur)); const i = Math.max(0, Math.min(width-1, Math.round(p*(width-1))))
+  const left = '─'.repeat(i), right = '─'.repeat(width-1-i)
+  return `${left}🔘${right}`
+}
+
 // ---- HELP UI (embed + menu + bottoni) ----
 const HELP_SECTIONS = {
   main: new EmbedBuilder()
-    .setTitle('📖 Menu Comandi')
-    .setDescription('Seleziona una categoria dal menu qui sotto per vedere i comandi.\nPrefisso: `!`')
+    .setColor(THEME.color)
+    .setTitle(`${EMO.help} Menu Comandi`)
+    .setDescription('Seleziona una categoria qui sotto.\nPrefisso: `!`')
     .addFields(
       { name: '🎵 Musica', value: '`play`, `pause`, `resume`' },
       { name: '🧭 Coda', value: '`queue`, `skip`, `stop`' },
       { name: '⚙️ Varie', value: '`leave`, `np`, `help`' }
     ),
   music: new EmbedBuilder()
+    .setColor(THEME.color)
     .setTitle('🎵 Comandi Musica')
     .setDescription([
       '`!play <link|titolo>` — cerca/streamma e riproduce subito',
@@ -35,6 +54,7 @@ const HELP_SECTIONS = {
       '`!resume` — riprende la riproduzione'
     ].join('\n')),
   queue: new EmbedBuilder()
+    .setColor(THEME.color)
     .setTitle('🧭 Comandi Coda')
     .setDescription([
       '`!queue` — mostra la coda',
@@ -42,6 +62,7 @@ const HELP_SECTIONS = {
       '`!stop` — ferma tutto e svuota la coda'
     ].join('\n')),
   misc: new EmbedBuilder()
+    .setColor(THEME.color)
     .setTitle('⚙️ Altri Comandi')
     .setDescription([
       '`!leave` — il bot esce dal canale vocale',
@@ -70,51 +91,13 @@ function helpComponents(active = 'main') {
   return [row1, row2]
 }
 
-// ---- NOW PLAYING CONTROLS ----
-function controlEmbed(title, status = 'idle') {
-  const playing = status === 'playing'
-  return new EmbedBuilder()
-    .setTitle(playing ? '🎧 In riproduzione' : '⏹️ Non in riproduzione')
-    .setDescription(playing ? `**${title || '—'}**` : 'Usa `!play <link|titolo>` per iniziare.')
-}
-
-function controlComponents(status = 'idle') {
-  const playing = status === 'playing'
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(playing ? 'ctrl_pause' : 'ctrl_resume')
-      .setLabel(playing ? 'Pausa' : 'Riprendi').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('ctrl_skip').setLabel('Skip').setStyle(ButtonStyle.Primary).setDisabled(!playing),
-    new ButtonBuilder().setCustomId('ctrl_stop').setLabel('Stop').setStyle(ButtonStyle.Danger).setDisabled(!playing),
-    new ButtonBuilder().setCustomId('ctrl_queue').setLabel('Queue').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('ctrl_leave').setLabel('Leave').setStyle(ButtonStyle.Secondary)
-  )
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ctrl_refresh').setLabel('Refresh').setStyle(ButtonStyle.Secondary)
-  )
-  return [row, row2]
-}
-
-async function upsertControls(guildId, status = 'idle') {
-  const data = queues.get(guildId); if (!data || !data.textChannel) return
-  const embed = controlEmbed(data.nowTitle, status)
-  const comps = controlComponents(status)
-  try {
-    if (data.controlsMsgId) {
-      const m = await data.textChannel.messages.fetch(data.controlsMsgId).catch(() => null)
-      if (m) { await m.edit({ embeds: [embed], components: comps }); return }
-    }
-    const sent = await data.textChannel.send({ embeds: [embed], components: comps })
-    data.controlsMsgId = sent.id
-  } catch (e) { console.error('[controls]', e) }
-}
-
 // ---------- Helpers ----------
 function ensureGuild(guildId, channel){
   if(!queues.has(guildId)){
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } })
     const data = { 
       queue: [], player, textChannel: channel, current: null, playing: false,
-      nowTitle: null, controlsMsgId: null
+      nowTitle: null, controlsMsgId: null, thumbnail: null, uploader: null, duration: null, requester: null
     }
     player.on(AudioPlayerStatus.Idle, () => {
       data.playing = false
@@ -140,7 +123,7 @@ function cleanup(data){
 
 function isUrl(s){ try{ new URL(s); return true } catch { return false } }
 
-// Titolo veloce (senza URL) per UX
+// Titolo veloce (fallback semplice)
 function quickTitle(input){
   return new Promise((resolve) => {
     const args = ['--no-playlist','--no-progress','-f','ba[acodec=opus]/ba/bestaudio','--get-title']
@@ -148,6 +131,27 @@ function quickTitle(input){
     const p = spawn('yt-dlp', args, { stdio: ['ignore','pipe','pipe'] })
     let out=''; p.stdout.on('data',d=>out+=d.toString())
     p.on('close', () => resolve(out.trim().split('\n')[0] || input))
+  })
+}
+
+// 📎 Metadati completi per l'embed "Now Playing"
+function resolveMeta(input){
+  return new Promise((resolve) => {
+    const args = ['--no-playlist','-f','ba[acodec=opus]/ba/bestaudio',
+      '--get-title','--get-duration','--get-thumbnail','--get-uploader']
+    const query = isUrl(input) ? input : ('ytsearch1:'+input)
+    const p = spawn('yt-dlp', [...args, query], { stdio: ['ignore','pipe','pipe'] })
+    let out = ''; p.stdout.on('data', d => out += d.toString())
+    p.on('close', () => {
+      const lines = out.trim().split('\n')
+      const meta = {
+        title: lines[0] || input,
+        duration: (lines[1]||'').split(':').reduce((acc,v)=>acc*60+Number(v||0),0) || null,
+        thumbnail: lines[2] || null,
+        uploader: lines[3] || 'YouTube'
+      }
+      resolve(meta)
+    })
   })
 }
 
@@ -174,6 +178,61 @@ function streamingPipeline(urlOrQuery){
   return { feeder, proc: ffmpeg, stream: ffmpeg.stdout }
 }
 
+// ---- NOW PLAYING CONTROLS ----
+function controlEmbed(data, status = 'idle') {
+  const playing = status === 'playing'
+  const e = new EmbedBuilder()
+    .setColor(playing ? THEME.color : 0x2F3136)
+    .setTitle(playing ? `${EMO.play} In riproduzione` : '⏹️ Non in riproduzione')
+    .setTimestamp(new Date())
+    .setFooter({ text: data?.requester ? `Richiesto da ${data.requester}` : 'Music-Pot • prefix !', iconURL: data?.thumbnail || undefined })
+
+  if (playing) {
+    const pos = 0 // (placeholder; tracciare progress richiede timecode dal player)
+    const bar = progressBar(pos, data.duration || 0)
+    e.setDescription([
+      `**${data.nowTitle || '—'}**`,
+      data.uploader ? `*di* **${data.uploader}**` : '',
+      '',
+      `\`${bar}\`  \`${fmtDur(pos)} / ${fmtDur(data.duration||0)}\``
+    ].filter(Boolean).join('\n'))
+    if (data.thumbnail) e.setThumbnail(data.thumbnail)
+  } else {
+    e.setDescription(`Usa \`!play <link|titolo>\` per iniziare.`)
+  }
+  return e
+}
+
+function controlComponents(status = 'idle') {
+  const playing = status === 'playing'
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(playing ? 'ctrl_pause' : 'ctrl_resume')
+      .setLabel(playing ? 'Pausa' : 'Riprendi').setEmoji(playing ? EMO.pause : EMO.resume).setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ctrl_skip').setLabel('Skip').setEmoji(EMO.skip).setStyle(ButtonStyle.Primary).setDisabled(!playing),
+    new ButtonBuilder().setCustomId('ctrl_stop').setLabel('Stop').setEmoji(EMO.stop).setStyle(ButtonStyle.Danger).setDisabled(!playing),
+    new ButtonBuilder().setCustomId('ctrl_queue').setLabel('Coda').setEmoji(EMO.queue).setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ctrl_leave').setLabel('Leave').setEmoji(EMO.leave).setStyle(ButtonStyle.Secondary)
+  )
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('ctrl_refresh').setLabel('Refresh').setEmoji(EMO.refresh).setStyle(ButtonStyle.Secondary)
+  )
+  return [row, row2]
+}
+
+async function upsertControls(guildId, status = 'idle') {
+  const data = queues.get(guildId); if (!data || !data.textChannel) return
+  const embed = controlEmbed(data, status)
+  const comps = controlComponents(status)
+  try {
+    if (data.controlsMsgId) {
+      const m = await data.textChannel.messages.fetch(data.controlsMsgId).catch(() => null)
+      if (m) { await m.edit({ embeds: [embed], components: comps }); return }
+    }
+    const sent = await data.textChannel.send({ embeds: [embed], components: comps })
+    data.controlsMsgId = sent.id
+  } catch (e) { console.error('[controls]', e) }
+}
+
 // ---------- Core playback ----------
 async function playNext(guildId){
   const data = queues.get(guildId); if (!data) return
@@ -186,14 +245,22 @@ async function playNext(guildId){
   if (next.placeholderId){
     try { msg = await data.textChannel.messages.fetch(next.placeholderId) } catch { msg = null }
   }
-  if (!msg) { try { msg = await data.textChannel.send(`⏳ Sto cercando: **${next.query}**`) } catch{} }
+  if (!msg) { try { msg = await data.textChannel.send(`⏳ ${EMO.search} Sto cercando: **${next.query}**`) } catch{} }
 
   const slowTimer = setTimeout(() => {
     if (msg) { try { msg.edit(`🔎 Ancora un attimo… cerco la versione migliore di **${next.query}**`) } catch {} }
   }, 1000)
 
   try {
-    const title = await quickTitle(next.query)
+    // Metadati ricchi per l'embed
+    const meta = await resolveMeta(next.query)
+    const title = meta.title
+    data.nowTitle = title
+    data.thumbnail = meta.thumbnail
+    data.uploader = meta.uploader
+    data.duration = meta.duration
+    data.requester = next.requester || null
+
     const { feeder, proc, stream } = streamingPipeline(next.query)
     data.current = { feeder, proc }
 
@@ -201,7 +268,6 @@ async function playNext(guildId){
     const resource = createAudioResource(stream, { inputType: StreamType.OggOpus })
     data.player.once(AudioPlayerStatus.Playing, async () => {
       clearTimeout(slowTimer)
-      data.nowTitle = title
       if (msg) { try { await msg.edit(`▶️ In riproduzione: **${title}**`) } catch {} }
       upsertControls(guildId, 'playing')
     })
@@ -251,7 +317,7 @@ client.on('interactionCreate', async (i) => {
       if (i.customId === 'help_prev')  return void i.update({ embeds: [HELP_SECTIONS.main],  components: helpComponents('main') })
       if (i.customId === 'help_music') return void i.update({ embeds: [HELP_SECTIONS.music], components: helpComponents('music') })
       if (i.customId === 'help_queue') return void i.update({ embeds: [HELP_SECTIONS.queue], components: helpComponents('queue') })
-      if (i.customId === 'help_misc') return void i.update({ embeds: [HELP_SECTIONS.misc],  components: helpComponents('misc') })
+      if (i.customId === 'help_misc')  return void i.update({ embeds: [HELP_SECTIONS.misc],  components: helpComponents('misc') })
     }
 
     // ----- CONTROLS -----
@@ -324,8 +390,8 @@ client.on('messageCreate', async (m) => {
     })
     conn.subscribe(data.player)
 
-    const placeholder = await m.reply(`⏳ Sto cercando: **${q}**`)
-    data.queue.push({ query: q, placeholderId: placeholder.id })
+    const placeholder = await m.reply(`⏳ ${EMO.search} Sto cercando: **${q}**`)
+    data.queue.push({ query: q, placeholderId: placeholder.id, requester: m.author?.tag })
     if (data.player.state.status === AudioPlayerStatus.Idle && !data.playing) playNext(m.guildId).catch(()=>{})
     return
   }
